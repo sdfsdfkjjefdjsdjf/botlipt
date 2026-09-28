@@ -225,7 +225,7 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
                   font=font(23, True), fill=GREEN if i == 0 else ORANGE)
         if i < 4:
             draw.line((510, y + 35, 899, y + 35), fill="#48515B", width=1)
-    explanation = "* Слова, аргументы, диалог; не реальный IQ"
+    explanation = ""
     draw.text((510, lower_y + 306), fit_text(draw, explanation, font(16), 391),
               font=font(16), fill=MUTED)
 
