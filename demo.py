@@ -55,6 +55,23 @@ def main() -> None:
     target.write_bytes(render_dashboard(stats, pictures))
     print(target)
 
+    short_texts = [
+        ("Алексей", "Прикольный бот может собирать план обсуждений и находить повторяющиеся темы."),
+        ("Алексей", "Да, бот сможет объединять похожие сообщения в одну тему."),
+        ("Мария", "Давайте месяц использовать GPT для заметок и рабочих задач."),
+        ("Мария", "Согласна, GPT поможет составлять ежедневную сводку по задачам."),
+        ("Алексей", "Сделаем первый тест сегодня вечером и обсудим результаты?"),
+    ]
+    compact_messages = [
+        {"date": now - (5 - i) * 600, "message_id": i + 1,
+         "sender_id": str(1 if name == "Алексей" else 2), "sender_name": name,
+         "text": body, "photo_file_id": None}
+        for i, (name, body) in enumerate(short_texts)
+    ]
+    compact = Path(__file__).with_name("demo_compact.png")
+    compact.write_bytes(render_dashboard(analyze(compact_messages, now, "Asia/Qyzylorda")))
+    print(compact)
+
 
 if __name__ == "__main__":
     main()

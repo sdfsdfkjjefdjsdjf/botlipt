@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+from datetime import datetime
 from pathlib import Path
 import sqlite3
 import sys
@@ -14,6 +16,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 import uuid
+from zoneinfo import ZoneInfo
 
 from analytics import WINDOW_SECONDS, analyze
 from render import render_dashboard
@@ -22,10 +25,19 @@ from render import render_dashboard
 LOG = logging.getLogger("chat_dashboard")
 HELP = (
     "📊 /dashboard — картинка со сводкой чата за последние 24 часа.\n"
+    "🕘 Ежедневный отчёт приходит автоматически в настроенное время.\n"
     "Бот учитывает сообщения, полученные после добавления в группу. "
     "Для полного обзора сделайте его администратором либо отключите режим приватности "
     "в @BotFather и добавьте в группу заново. Данные старше 24 часов удаляются."
 )
+
+# Telegram also delivers membership changes and other service events as Message
+# objects. They are not chat content and must not inflate activity statistics.
+CONTENT_KEYS = {
+    "text", "photo", "video", "animation", "document", "audio", "voice",
+    "video_note", "sticker", "contact", "location", "venue", "poll",
+    "dice", "game", "invoice", "paid_media", "story",
+}
 
 
 class TelegramAPIError(Exception):
@@ -108,6 +120,29 @@ class MessageStore:
             )
         """)
         self.conn.execute("CREATE INDEX IF NOT EXISTS messages_date_idx ON messages(date)")
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id INTEGER PRIMARY KEY,
+                last_seen INTEGER NOT NULL
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS daily_reports (
+                chat_id INTEGER NOT NULL,
+                local_day TEXT NOT NULL,
+                sent_at INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, local_day)
+            )
+        """)
+        self.conn.execute("""
+            INSERT OR IGNORE INTO chats (chat_id, last_seen)
+            SELECT chat_id, MAX(date) FROM messages GROUP BY chat_id
+        """)
+        # Earlier releases stored Telegram service events as empty messages.
+        # Clean those legacy rows once; new content-only ingestion follows below.
+        if self.conn.execute("PRAGMA user_version").fetchone()[0] < 1:
+            self.conn.execute("DELETE FROM messages WHERE text = '' AND photo_file_id IS NULL")
+            self.conn.execute("PRAGMA user_version = 1")
         self.conn.commit()
 
     def upsert(self, msg: dict[str, Any]) -> None:
@@ -130,6 +165,28 @@ class MessageStore:
 
     def prune(self, now: int) -> None:
         self.conn.execute("DELETE FROM messages WHERE date < ?", (now - WINDOW_SECONDS,))
+        self.conn.execute("DELETE FROM daily_reports WHERE sent_at < ?", (now - 8 * WINDOW_SECONDS,))
+        self.conn.commit()
+
+    def register_chat(self, chat_id: int, now: int) -> None:
+        self.conn.execute("""
+            INSERT INTO chats (chat_id, last_seen) VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET last_seen = excluded.last_seen
+        """, (chat_id, now))
+        self.conn.commit()
+
+    def chat_ids(self) -> list[int]:
+        return [row[0] for row in self.conn.execute("SELECT chat_id FROM chats")]
+
+    def daily_sent(self, chat_id: int, local_day: str) -> bool:
+        return self.conn.execute("""
+            SELECT 1 FROM daily_reports WHERE chat_id = ? AND local_day = ?
+        """, (chat_id, local_day)).fetchone() is not None
+
+    def mark_daily_sent(self, chat_id: int, local_day: str, now: int) -> None:
+        self.conn.execute("""
+            INSERT OR IGNORE INTO daily_reports (chat_id, local_day, sent_at) VALUES (?, ?, ?)
+        """, (chat_id, local_day, now))
         self.conn.commit()
 
     def recent(self, chat_id: int, now: int) -> list[dict[str, Any]]:
@@ -150,6 +207,45 @@ def parse_command(text: str, bot_username: str) -> str | None:
     return command.casefold()
 
 
+def parse_report_time(value: str) -> tuple[int, int]:
+    match = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", value)
+    if not match:
+        raise ValueError("AUTO_REPORT_TIME must have HH:MM format, e.g. 09:00")
+    return int(match.group(1)), int(match.group(2))
+
+
+def send_dashboard(api: TelegramAPI, store: MessageStore, chat_id: int,
+                   now: int, tz_name: str, daily: bool = False) -> None:
+    api.call("sendChatAction", {"chat_id": chat_id, "action": "upload_photo"})
+    stats = analyze(store.recent(chat_id, now), now, tz_name)
+    photos = [api.download_photo(item["photo_file_id"]) for item in stats["photos"]]
+    png = render_dashboard(stats, photos)
+    caption = "📊 Ежедневная сводка за 24 часа" if daily else "📊 Сводка за последние 24 часа"
+    api.send_photo(chat_id, png, caption)
+    LOG.info("Sent %s dashboard to chat %s: %s messages",
+             "daily" if daily else "manual", chat_id, stats["messages"])
+
+
+def send_due_daily_reports(api: TelegramAPI, store: MessageStore, now: int,
+                           tz_name: str, report_time: tuple[int, int]) -> None:
+    try:
+        timezone = ZoneInfo(tz_name)
+    except (KeyError, ValueError):
+        timezone = ZoneInfo("UTC")
+    local = datetime.fromtimestamp(now, timezone)
+    if (local.hour, local.minute) < report_time:
+        return
+    day = local.date().isoformat()
+    for chat_id in store.chat_ids():
+        if store.daily_sent(chat_id, day):
+            continue
+        try:
+            send_dashboard(api, store, chat_id, now, tz_name, daily=True)
+            store.mark_daily_sent(chat_id, day, now)
+        except Exception:
+            LOG.exception("Could not send daily dashboard to chat %s", chat_id)
+
+
 def handle_update(update: dict[str, Any], api: TelegramAPI, store: MessageStore,
                   bot_username: str, tz_name: str) -> None:
     msg = update.get("message") or update.get("edited_message")
@@ -164,23 +260,19 @@ def handle_update(update: dict[str, Any], api: TelegramAPI, store: MessageStore,
 
     now = int(time.time())
     store.prune(now)
+    store.register_chat(chat["id"], now)
     command = parse_command(msg.get("text") or "", bot_username)
     if command in {"dashboard", "report"}:
-        api.call("sendChatAction", {"chat_id": chat["id"], "action": "upload_photo"})
-        stats = analyze(store.recent(chat["id"], now), now, tz_name)
-        photos = [api.download_photo(item["photo_file_id"]) for item in stats["photos"]]
-        png = render_dashboard(stats, photos)
-        api.send_photo(chat["id"], png, "📊 Сводка за последние 24 часа")
-        LOG.info("Sent dashboard to chat %s: %s messages", chat["id"], stats["messages"])
+        send_dashboard(api, store, chat["id"], now, tz_name)
     elif command in {"start", "help"}:
         api.call("sendMessage", {"chat_id": chat["id"], "text": HELP})
-    else:
+    elif any(key in msg for key in CONTENT_KEYS):
         store.upsert(msg)
 
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    token = os.environ.get("BOT_TOKEN", "8976041838:AAFhJYoTE2uqDCOOSWmJpZJxF1VAVEouarU").strip()
+    token = os.environ.get("BOT_TOKEN", "").strip()
     if not token:
         print("Задайте BOT_TOKEN в переменной окружения. Инструкция: README.md", file=sys.stderr)
         return 2
@@ -189,9 +281,11 @@ def main() -> int:
     username = info["username"]
     db_path = Path(os.environ.get("DASHBOARD_DB", "dashboard.sqlite3"))
     tz_name = os.environ.get("DASHBOARD_TZ", "UTC")
+    report_time = parse_report_time(os.environ.get("AUTO_REPORT_TIME", "09:00"))
     store = MessageStore(db_path)
     offset: int | None = None
-    LOG.info("Started @%s; timezone=%s; database=%s", username, tz_name, db_path)
+    LOG.info("Started @%s; timezone=%s; daily=%02d:%02d; database=%s",
+             username, tz_name, *report_time, db_path)
     while True:
         try:
             payload: dict[str, Any] = {"timeout": 30, "allowed_updates": '["message","edited_message"]'}
@@ -206,6 +300,7 @@ def main() -> int:
                     LOG.exception("Failed to process update %s", update.get("update_id"))
             if not updates:
                 store.prune(int(time.time()))
+            send_due_daily_reports(api, store, int(time.time()), tz_name, report_time)
         except (TelegramAPIError, URLError, TimeoutError, OSError):
             LOG.exception("Telegram connection failed; retrying in 5 seconds")
             time.sleep(5)
