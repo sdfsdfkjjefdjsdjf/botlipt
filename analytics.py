@@ -23,6 +23,7 @@ STOPWORDS = set("""
 просто потом сейчас сегодня вчера завтра можно надо нужно ещё уже всем всем
 будет будем будут такой такая такие этом потому поэтому спасибо привет
 пожалуйста ок окей нету щас типо типа либо вроде вообще там тут нас вам них
+который которая которое которые которых которому которым которую который
 the and for are was were you your this that with from have has not but can
 will just about what when where how who why into over then than they them
 иә жоқ мен сен біз сіз олар бұл сол үшін бар менің сенің оның осы болып
@@ -33,6 +34,15 @@ RUSSIAN_ENDINGS = tuple(sorted("""
 ыми ими ого его ому ему ами ями ах ях ам ям ом ем ой ей
 ия ие ые ый ий ая яя ое ее ы и а я у ю е о ов ев ь
 """.split(), key=len, reverse=True))
+REASON_MARKERS = (
+    "потому что", "так как", "поскольку", "поэтому", "следовательно",
+    "например", "к примеру", "допустим", "то есть", "если", "значит",
+    "во-первых", "во-вторых", "иначе", "из-за", "ведь",
+)
+PROPOSAL_RE = re.compile(r"\b(?:предлагаю|давайте|можно|нужно|стоит|мб|может|попробуем)\b")
+AGREEMENT_RE = re.compile(r"^\s*(?:да[,! ]|согласен\b|согласна\b|поддерживаю\b|точно\b)")
+TOPIC_FILLERS = {"прикольный", "может", "сможет", "сделает", "сделать", "давайте",
+                 "использовать", "хороший", "хорошую", "сегодня", "первый", "весь"}
 
 
 def tokens(text: str) -> list[str]:
@@ -53,6 +63,40 @@ def stem(word: str) -> str:
 def clip(text: str, limit: int) -> str:
     text = " ".join(text.split())
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def describe_topic(title: str, items: list[dict[str, Any]], other: bool = False) -> str:
+    """Build a structured, source-grounded narrative without an external model."""
+    chosen: list[dict[str, Any]] = [items[0]]
+    if len(items) > 2:
+        middle = next((item for item in items[1:-1]
+                       if PROPOSAL_RE.search((item.get("text") or "").casefold())), None)
+        if middle is None:
+            middle = max(items[1:-1], key=lambda item: len(tokens(item.get("text") or "")))
+        chosen.append(middle)
+    if len(items) > 1:
+        chosen.append(items[-1])
+
+    sentences = ["Помимо главных тем, участники затронули и другие вопросы."] if other else []
+    for index, item in enumerate(chosen):
+        body = clip(item.get("text") or "", 150).strip().rstrip(".")
+        if not body:
+            continue
+        if index == 0:
+            opening = "Разговор начался с вопроса" if "?" in body else (
+                "Сначала участники предложили" if PROPOSAL_RE.search(body.casefold()) else
+                "Разговор начался с мысли")
+        elif "?" in (item.get("text") or ""):
+            opening = "Позже участники задали вопрос"
+        elif AGREEMENT_RE.search(body.casefold()):
+            opening = "Идею поддержали и развили"
+        elif PROPOSAL_RE.search(body.casefold()):
+            opening = "Затем появилось предложение"
+        else:
+            opening = "Позже тему уточнили"
+        suffix = "" if body.endswith(("?", "!", "…")) else "."
+        sentences.append(f"{opening}: «{body}»{suffix}")
+    return clip(" ".join(sentences), 620)
 
 
 def build_topics(text_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -96,7 +140,8 @@ def build_topics(text_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if cluster.get("other"):
             title = "Другие темы"
         else:
-            counts = Counter(word for item in items for word in tokens(item.get("text") or ""))
+            counts = Counter(word for item in items for word in tokens(item.get("text") or "")
+                             if word not in TOPIC_FILLERS)
             title = " · ".join(word.capitalize() if i == 0 else word
                                for i, (word, _) in enumerate(counts.most_common(3))) or "Обсуждение"
         chosen = []
@@ -108,8 +153,8 @@ def build_topics(text_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 seen_texts.add(body)
         if len(chosen) > 4:
             chosen = [chosen[0], *chosen[-3:]]
-        combined = " • ".join(clip(item.get("text") or "", 240) for item in chosen)
-        topics.append({"title": title, "summary": clip(combined, 640), "count": len(items)})
+        topics.append({"title": title, "summary": describe_topic(title, chosen, cluster.get("other", False)),
+                       "count": len(items)})
     return topics
 
 
@@ -118,17 +163,41 @@ def estimate_participant_scores(text_messages: list[dict[str, Any]]) -> list[dic
     by_person: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for msg in text_messages:
         by_person[str(msg.get("sender_id") or "unknown")].append(msg)
+    engaged: Counter[str] = Counter()
+    for index, msg in enumerate(text_messages):
+        sender_id = str(msg.get("sender_id") or "unknown")
+        current_terms = {stem(word) for word in tokens(msg.get("text") or "")}
+        for previous in reversed(text_messages[max(0, index - 4):index]):
+            if msg["date"] - previous["date"] > 3600:
+                break
+            if sender_id == str(previous.get("sender_id") or "unknown"):
+                continue
+            previous_terms = {stem(word) for word in tokens(previous.get("text") or "")}
+            if current_terms & previous_terms:
+                engaged[sender_id] += 1
+                break
     result = []
     for sender_id, items in by_person.items():
         all_tokens = [word for msg in items for word in tokens(msg.get("text") or "")]
         if len(items) < 2 or len(all_tokens) < 8:
             continue
-        vocabulary = min(1.0, len({stem(word) for word in all_tokens}) / (0.65 * len(all_tokens)))
+        vocabulary = min(1.0, len({stem(word) for word in all_tokens}) / max(12, 0.68 * len(all_tokens)))
         elaboration = min(1.0, mean(min(len(tokens(msg.get("text") or "")), 30) for msg in items) / 14)
-        questions = min(1.0, sum("?" in (msg.get("text") or "") for msg in items) / (0.25 * len(items)))
-        score = round(72 + 58 * (0.35 * vocabulary + 0.55 * elaboration + 0.10 * questions))
+        reasoning_count = sum(any(marker in (msg.get("text") or "").casefold()
+                                  for marker in REASON_MARKERS) for msg in items)
+        reasoning = min(1.0, reasoning_count / max(1, 0.35 * len(items)))
+        dialogue = min(1.0, engaged[sender_id] / max(1, 0.40 * len(items)))
+        questions = min(1.0, sum("?" in (msg.get("text") or "") for msg in items) / max(1, 0.30 * len(items)))
+        bodies = [" ".join((msg.get("text") or "").casefold().split()) for msg in items]
+        duplicates = 1 - len(set(bodies)) / len(bodies)
+        very_short = sum(len(tokens(msg.get("text") or "")) < 3 for msg in items) / len(items)
+        penalty = 0.22 * duplicates + 0.10 * very_short
+        quality = (0.22 * vocabulary + 0.28 * elaboration + 0.25 * reasoning
+                   + 0.18 * dialogue + 0.07 * questions - penalty)
+        score = max(70, min(130, round(70 + 60 * quality)))
         result.append({"sender_id": sender_id, "name": items[-1].get("sender_name") or "Участник",
-                       "score": score, "messages": len(items)})
+                       "score": score, "messages": len(items), "reasoning": reasoning_count,
+                       "dialogue": engaged[sender_id]})
     return sorted(result, key=lambda item: (-item["score"], -item["messages"], item["name"]))
 
 

@@ -117,8 +117,28 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(len(stats["topics"]), 2)
         self.assertTrue(any("Бот сделает" in item["summary"] and "Бот добавляет" in item["summary"]
                             for item in stats["topics"]))
+        self.assertTrue(all("«" in item["summary"] and "»" in item["summary"]
+                            for item in stats["topics"]))
         self.assertEqual(len(stats["participant_scores"]), 2)
         self.assertIsNotNone(stats["average_score"])
+
+    def test_reasoned_dialogue_scores_above_repetition(self):
+        now = 2_000_000_000
+        entries = [
+            ("2", "Борис", "Как лучше организовать встречу и почему текущий план неудобен?"),
+            ("1", "Аня", "Потому что место далеко от метро, предлагаю встретиться у парка рядом с кафе."),
+            ("3", "Спам", "Наш чудесный бот сделает чудесные вещи для чата."),
+            ("1", "Аня", "Например, там можно заранее выбрать время и записать пожелания каждого участника."),
+            ("3", "Спам", "Наш чудесный бот сделает чудесные вещи для чата."),
+            ("1", "Аня", "Если погода испортится, перенесём встречу в кафе и сообщим об этом всем заранее."),
+            ("3", "Спам", "Наш чудесный бот сделает чудесные вещи для чата."),
+        ]
+        messages = [{"date": now - (len(entries) - i) * 180, "message_id": i,
+                     "sender_id": person, "sender_name": name, "text": body,
+                     "photo_file_id": None}
+                    for i, (person, name, body) in enumerate(entries)]
+        scores = {item["name"]: item["score"] for item in analyze(messages, now)["participant_scores"]}
+        self.assertGreater(scores["Аня"], scores["Спам"])
 
     def test_daily_report_sent_once_per_local_day(self):
         class FakeAPI:

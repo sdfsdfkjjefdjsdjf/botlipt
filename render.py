@@ -109,7 +109,7 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
     topics = stats.get("topics", [])
     topic_layout = []
     for item in topics:
-        lines = wrap_lines(measure, item["summary"], font(23), 1200, 5)
+        lines = wrap_lines(measure, item["summary"], font(23), 1200, 6)
         topic_layout.append((item, lines, max(112, 70 + len(lines) * 30)))
     topic_height = 80 + sum(row[2] for row in topic_layout) + max(0, len(topic_layout) - 1) * 12 + 23
     if not topic_layout:
@@ -209,7 +209,9 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
                   font=font(23, True), fill=GREEN if i == 0 else ORANGE)
         if i < 4:
             draw.line((510, y + 35, 899, y + 35), fill="#30425D", width=1)
-    draw.text((510, lower_y + 306), "* Игровой балл по текстам, не реальный IQ", font=font(16), fill=MUTED)
+    explanation = "* Слова, аргументы, диалог; не реальный IQ"
+    draw.text((510, lower_y + 306), fit_text(draw, explanation, font(16), 391),
+              font=font(16), fill=MUTED)
 
     # Word cloud as compact chips.
     draw.text((963, lower_y + 22), "Частые слова", font=font(27, True), fill=WHITE)
