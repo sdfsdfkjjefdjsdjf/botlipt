@@ -6,18 +6,19 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 
 WIDTH = 1400
-BG = "#0D1729"
-CARD = "#182842"
-CARD_ALT = "#203451"
-WHITE = "#F3F7FC"
-MUTED = "#A6B5C9"
-CYAN = "#64D9E6"
-ORANGE = "#FFC186"
-GREEN = "#8DE6B1"
+BG = "#10151B"
+CARD = (15, 21, 30, 174)
+CARD_ALT = (33, 40, 50, 180)
+WHITE = "#F2F0ED"
+MUTED = "#B8BEC5"
+CYAN = "#CBD5DF"
+ORANGE = "#C9AB87"
+GREEN = "#A9BDB3"
+PORTRAIT = Path(__file__).parent / "assets" / "silver_guardian.jpg"
 
 
 def font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -72,8 +73,23 @@ def wrap_lines(draw: ImageDraw.ImageDraw, value: str, face: ImageFont.ImageFont,
     return lines
 
 
-def card(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], fill: str = CARD) -> None:
-    draw.rounded_rectangle(box, radius=23, fill=fill)
+def card(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], fill: tuple[int, int, int, int] = CARD) -> None:
+    draw.rounded_rectangle(box, radius=23, fill=fill, outline=(223, 226, 232, 62), width=2)
+
+
+def portrait_background(height: int) -> Image.Image:
+    """Darkened source portrait beneath the translucent dashboard panels."""
+    if not PORTRAIT.exists():
+        return Image.new("RGB", (WIDTH, height), BG)
+    with Image.open(PORTRAIT) as original:
+        image = ImageOps.fit(original.convert("RGB"), (WIDTH, height),
+                             method=Image.Resampling.LANCZOS, centering=(0.48, 0.32))
+    image = ImageEnhance.Color(image).enhance(0.58)
+    image = ImageEnhance.Brightness(image).enhance(0.72)
+    image = image.filter(ImageFilter.GaussianBlur(1.0))
+    shade = Image.new("RGBA", (WIDTH, height), (4, 7, 12, 75))
+    shaded = Image.alpha_composite(image.convert("RGBA"), shade)
+    return shaded.convert("RGB")
 
 
 def photo_tile(canvas: Image.Image, draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int],
@@ -125,8 +141,8 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
     footer_y = photo_y + photo_height + (22 if photos else 0)
     height = footer_y + 55
 
-    canvas = Image.new("RGB", (WIDTH, height), BG)
-    draw = ImageDraw.Draw(canvas)
+    canvas = portrait_background(height)
+    draw = ImageDraw.Draw(canvas, "RGBA")
     draw.rounded_rectangle((44, 38, 105, 99), radius=16, fill=CYAN)
     draw.text((61, 48), "24", font=font(30, True), fill=BG)
     draw.text((126, 37), "Дайджест чата", font=font(46, True), fill=WHITE)
@@ -183,7 +199,7 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
         count = str(item["count"])
         draw.text((443 - text_width(draw, count, font(19, True)), y), count,
                   font=font(19, True), fill=CYAN)
-        draw.rounded_rectangle((68, y + 28, 444, y + 34), radius=3, fill="#30425D")
+        draw.rounded_rectangle((68, y + 28, 444, y + 34), radius=3, fill=(52, 59, 68, 220))
         draw.rounded_rectangle((68, y + 28, 68 + int(376 * item["count"] / top_count), y + 34),
                                radius=3, fill=CYAN)
     draw.text((68, lower_y + 253), "По часам", font=font(18, True), fill=MUTED)
@@ -193,7 +209,7 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
         x = 68 + i * 16
         bar_height = max(2, int(count / max_hour * 49))
         draw.rounded_rectangle((x, lower_y + 319 - bar_height, x + 10, lower_y + 319),
-                               radius=3, fill=CYAN if count else "#344862")
+                               radius=3, fill=CYAN if count else "#39434E")
 
     # Individual playful IQ scores. No psychometric claim is made.
     draw.text((510, lower_y + 22), "IQ участников*", font=font(27, True), fill=WHITE)
@@ -208,7 +224,7 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
         draw.text((900 - text_width(draw, score, font(23, True)), y - 1), score,
                   font=font(23, True), fill=GREEN if i == 0 else ORANGE)
         if i < 4:
-            draw.line((510, y + 35, 899, y + 35), fill="#30425D", width=1)
+            draw.line((510, y + 35, 899, y + 35), fill="#48515B", width=1)
     explanation = "* Слова, аргументы, диалог; не реальный IQ"
     draw.text((510, lower_y + 306), fit_text(draw, explanation, font(16), 391),
               font=font(16), fill=MUTED)
@@ -227,7 +243,7 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
             if y + 40 > lower_y + 326:
                 break
             draw.rounded_rectangle((x, y, x + chip_width, y + 38), radius=13,
-                                   fill=CARD_ALT if index % 2 else "#294561")
+                                   fill=CARD_ALT if index % 2 else (64, 74, 86, 190))
             draw.text((x + 13, y + 7), fit_text(draw, label, font(19, True), chip_width - 25),
                       font=font(19, True), fill=WHITE)
             x += chip_width + 8

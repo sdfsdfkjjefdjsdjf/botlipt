@@ -13,7 +13,7 @@ from render import render_dashboard
 
 
 def sample_photo(index: int) -> bytes:
-    palettes = [("#527B94", "#E3C793"), ("#8D5F77", "#EDBFA3"), ("#4D887D", "#BCE3BA")]
+    palettes = [("#58636C", "#C2B7A7"), ("#69656A", "#B9A38D"), ("#4E5A5B", "#B6C0B7")]
     a, b = palettes[index % len(palettes)]
     img = Image.new("RGB", (700, 450), a)
     d = ImageDraw.Draw(img)
