@@ -342,23 +342,13 @@ def format_text_report(stats: dict[str, Any], chat_id: int,
         heading = f'<a href="{link}"><b>{title}</b></a>' if link else f"<b>{title}</b>"
         lines.append(f"{index}. {heading} ({message_count_label(topic['count'])})")
     if stats["topics"]:
-        lines.extend(["", "<b>Подробнее о главных темах</b>"])
-    for topic in stats["topics"][:3]:
-        ids = topic.get("message_ids", [])[:3]
-        lines.append(f"<b>{escape(topic['title'])}</b>")
-        lines.append(escape(topic["summary"]))
-        source_links = [f'<a href="{url}">↗ реплика {number}</a>'
-                        for number, message_id in enumerate(ids, 1)
-                        if (url := message_link(chat_id, username, message_id))]
-        if source_links:
-            lines.append(" · ".join(source_links))
         lines.append("")
     photo_links = [f'<a href="{url}">фото {number}</a>'
                    f" (♥ {photo.get('reaction_count', 0)}, ответов {photo.get('reply_count', 0)})"
                    for number, photo in enumerate(stats["photos"][:3], 1)
                    if (url := message_link(chat_id, username, photo["message_id"]))]
     if photo_links:
-        lines.append("📷 " + " · ".join(photo_links))
+        lines.append("<b>📷 Фото с откликом:</b> " + " · ".join(photo_links))
     authors = stats.get("authors", [])[:3]
     if authors:
         lines.append("<b>Активные:</b> " + ", ".join(

@@ -27,6 +27,7 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(stats["messages"], 2)
         self.assertEqual(stats["participants"], 2)
         self.assertEqual(stats["photo_count"], 1)
+        self.assertEqual(stats["photos"], [])
         self.assertEqual(stats["authors"][0]["name"], "Аня")
         self.assertIn(("встреча", 2), stats["words"])
         self.assertEqual(sum(stats["hourly"]), 2)
@@ -170,7 +171,8 @@ class DashboardTests(unittest.TestCase):
             handle_update({"message_reaction_count": totals}, None, store, "OurBot", "UTC")
             handle_update({"message_reaction_count": totals}, None, store, "OurBot", "UTC")
             stats = analyze(store.recent(chat["id"], now), now)
-            self.assertEqual([photo["message_id"] for photo in stats["photos"]], [2, 1, 3])
+            self.assertEqual([photo["message_id"] for photo in stats["photos"]], [2, 1])
+            self.assertEqual(stats["photo_count"], 3)
             self.assertEqual((stats["photos"][0]["reaction_count"],
                               stats["photos"][0]["reply_count"]), (2, 2))
             self.assertEqual(stats["photos"][1]["reaction_count"], 3)
@@ -183,14 +185,16 @@ class DashboardTests(unittest.TestCase):
 
     def test_text_report_links_and_html_escaping(self):
         stats = {"start": "01.01 09:00", "end": "02.01 09:00", "messages": 2,
-                 "topics": [{"title": "Планы <завтра>", "summary": "Аня сказала: A&B < C",
-                             "count": 2, "message_ids": [12, 13]}], "photos": []}
+                 "topics": [{"title": "Планы <завтра> & дальше", "summary": "НЕ ПОКАЗЫВАТЬ",
+                             "count": 1, "message_ids": [12]},
+                            {"title": "Другая тема", "summary": "НЕ ПОКАЗЫВАТЬ",
+                             "count": 1, "message_ids": [13]}], "photos": []}
         public = format_text_report(stats, -100123, "mygroup")
         self.assertIn('href="https://t.me/mygroup/12"', public)
         self.assertIn('href="https://t.me/mygroup/13"', public)
-        self.assertIn("Планы &lt;завтра&gt;", public)
-        self.assertIn("A&amp;B &lt; C", public)
-        self.assertNotIn("A&B < C", public)
+        self.assertIn("Планы &lt;завтра&gt; &amp; дальше", public)
+        self.assertNotIn("НЕ ПОКАЗЫВАТЬ", public)
+        self.assertNotIn("Подробнее о главных темах", public)
         private = format_text_report(stats, -100123, None)
         self.assertIn('href="https://t.me/c/123/12"', private)
         basic = format_text_report(stats, -123, None)
@@ -207,16 +211,13 @@ class DashboardTests(unittest.TestCase):
         ]
         messages = [
             {"date": now - (len(texts) - i) * 300, "sender_id": sender_id,
-             "sender_name": name, "text": body, "message_id": i,
+             "sender_name": name, "text": body, "message_id": i + 1,
              "photo_file_id": None}
             for i, (sender_id, name, body) in enumerate(texts)
         ]
         stats = analyze(messages, now)
         self.assertEqual(len(stats["topics"]), 2)
-        self.assertTrue(any("Бот сделает" in item["summary"] and "Бот добавляет" in item["summary"]
-                            for item in stats["topics"]))
-        self.assertTrue(all("«" in item["summary"] and "»" in item["summary"]
-                            for item in stats["topics"]))
+        self.assertTrue(all(item["title"] and item["message_ids"] for item in stats["topics"]))
         self.assertEqual(len(stats["participant_scores"]), 2)
         self.assertIsNotNone(stats["average_score"])
 

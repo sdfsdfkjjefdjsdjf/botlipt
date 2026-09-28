@@ -39,8 +39,6 @@ REASON_MARKERS = (
     "например", "к примеру", "допустим", "то есть", "если", "значит",
     "во-первых", "во-вторых", "иначе", "из-за", "ведь",
 )
-PROPOSAL_RE = re.compile(r"\b(?:предлагаю|давайте|можно|нужно|стоит|мб|может|попробуем)\b")
-AGREEMENT_RE = re.compile(r"^\s*(?:да[,! ]|согласен\b|согласна\b|поддерживаю\b|точно\b)")
 TOPIC_PREFIX_RE = re.compile(
     r"^(?:(?:ну|короче|кстати|слушайте|ребята|друзья|согласна|согласен|"
     r"да|ага|точно|окей|мне кажется|я думаю|я считаю|думаю|хочу обсудить|"
@@ -76,7 +74,7 @@ def message_count_label(count: int) -> str:
     return f"{count} {ending}"
 
 
-def topic_title(items: list[dict[str, Any]]) -> str:
+def topic_title(items: list[dict[str, Any]]) -> tuple[str, int | None]:
     """Choose a readable source-grounded heading instead of a list of keywords."""
     frequencies = Counter(stem(word) for item in items for word in tokens(item.get("text") or ""))
     candidates = []
@@ -92,45 +90,11 @@ def topic_title(items: list[dict[str, Any]]) -> str:
         terms = {stem(word) for word in tokens(title)}
         relevance = sum(frequencies[word] for word in terms)
         length_bonus = 3 if 20 <= len(title) <= 75 else 0
-        candidates.append((relevance + length_bonus, -index, title))
+        candidates.append((relevance + length_bonus, -index, title, item.get("message_id")))
     if not candidates:
-        return "Обсуждение"
-    title = max(candidates)[2]
-    return title[0].upper() + title[1:]
-
-
-def describe_topic(title: str, items: list[dict[str, Any]], other: bool = False) -> str:
-    """Build a structured, source-grounded narrative without an external model."""
-    chosen: list[dict[str, Any]] = [items[0]]
-    if len(items) > 2:
-        middle = next((item for item in items[1:-1]
-                       if PROPOSAL_RE.search((item.get("text") or "").casefold())), None)
-        if middle is None:
-            middle = max(items[1:-1], key=lambda item: len(tokens(item.get("text") or "")))
-        chosen.append(middle)
-    if len(items) > 1:
-        chosen.append(items[-1])
-
-    sentences = ["Помимо главных тем, участники затронули и другие вопросы."] if other else []
-    for index, item in enumerate(chosen):
-        body = clip(item.get("text") or "", 150).strip().rstrip(".")
-        if not body:
-            continue
-        if index == 0:
-            opening = "Разговор начался с вопроса" if "?" in body else (
-                "Сначала участники предложили" if PROPOSAL_RE.search(body.casefold()) else
-                "Разговор начался с мысли")
-        elif "?" in (item.get("text") or ""):
-            opening = "Позже участники задали вопрос"
-        elif AGREEMENT_RE.search(body.casefold()):
-            opening = "Идею поддержали и развили"
-        elif PROPOSAL_RE.search(body.casefold()):
-            opening = "Затем появилось предложение"
-        else:
-            opening = "Позже тему уточнили"
-        suffix = "" if body.endswith(("?", "!", "…")) else "."
-        sentences.append(f"{opening}: «{body}»{suffix}")
-    return clip(" ".join(sentences), 620)
+        return "Обсуждение", items[0].get("message_id") if items else None
+    _, _, title, message_id = max(candidates)
+    return title[0].upper() + title[1:], message_id
 
 
 def build_topics(text_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -172,22 +136,11 @@ def build_topics(text_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for cluster in clusters:
         items = cluster["items"]
         if cluster.get("other"):
-            title = "Другие темы"
+            title, anchor_id = "Другие темы", items[0].get("message_id")
         else:
-            title = topic_title(items)
-        chosen = []
-        seen_texts = set()
-        for item in sorted(items, key=lambda m: m["date"]):
-            body = " ".join((item.get("text") or "").split()).casefold()
-            if body not in seen_texts:
-                chosen.append(item)
-                seen_texts.add(body)
-        if len(chosen) > 4:
-            chosen = [chosen[0], *chosen[-3:]]
-        source_items = chosen if len(chosen) <= 3 else [chosen[0], chosen[2], chosen[-1]]
-        topics.append({"title": title, "summary": describe_topic(title, chosen, cluster.get("other", False)),
-                       "count": len(items),
-                       "message_ids": [item["message_id"] for item in source_items if item.get("message_id")]})
+            title, anchor_id = topic_title(items)
+        topics.append({"title": title, "count": len(items),
+                       "message_ids": [anchor_id] if anchor_id else []})
     return topics
 
 
@@ -281,7 +234,8 @@ def analyze(messages: list[dict[str, Any]], now: int, tz_name: str = "UTC") -> d
         "participant_scores": scores,
         "average_score": round(mean(item["score"] for item in scores)) if scores else None,
         "photos": sorted(
-            photos,
+            (item for item in photos
+             if int(item.get("reaction_count") or 0) + int(item.get("reply_count") or 0) > 0),
             key=lambda item: (int(item.get("reaction_count") or 0) + int(item.get("reply_count") or 0),
                               int(item.get("reaction_count") or 0), item["date"], item["message_id"]),
             reverse=True,

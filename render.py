@@ -134,13 +134,8 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
     for item in topics:
         lines = wrap_lines(measure, item["title"], font(23, True), 960, 2)
         topic_rows.append((item, lines, max(52, 18 + len(lines) * 30)))
-    detail_rows = []
-    for item in topics[:3]:
-        lines = wrap_lines(measure, item["summary"], font(22), 1190, 5)
-        detail_rows.append((item, lines, max(106, 65 + len(lines) * 29)))
     list_height = sum(row[2] + 8 for row in topic_rows)
-    detail_height = (57 + sum(row[2] + 10 for row in detail_rows)) if detail_rows else 0
-    topic_height = 75 + list_height + detail_height + 20
+    topic_height = 75 + list_height + 20
     if not topic_rows:
         topic_height = 185
     topic_y = 294
@@ -192,15 +187,6 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
             draw.text((1304 - text_width(draw, count_label, font(18)), y + 16),
                       count_label, font=font(18), fill=MUTED)
             y += row_height + 8
-        draw.text((72, y + 11), "Подробнее о главных темах", font=font(23, True), fill=CYAN)
-        y += 57
-        for index, (item, lines, row_height) in enumerate(detail_rows):
-            card(draw, (70, y, 1330, y + row_height), CARD_ALT)
-            draw.text((91, y + 10), fit_text(draw, item["title"], font(20, True), 1180),
-                      font=font(20, True), fill=WHITE)
-            for line_index, line in enumerate(lines):
-                draw.text((91, y + 42 + line_index * 29), line, font=font(22), fill="#D9E4F0")
-            y += row_height + 10
 
     boxes = [(44, 468), (485, 923), (940, 1356)]
     for x1, x2 in boxes:
@@ -270,7 +256,7 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
 
     if photos:
         card(draw, (44, photo_y, 1356, photo_y + photo_height))
-        draw.text((70, photo_y + 20), "Фотографии за сутки", font=font(29, True), fill=WHITE)
+        draw.text((70, photo_y + 20), "Фото с реакциями или ответами", font=font(29, True), fill=WHITE)
         for i, info in enumerate(photos):
             column, row = i % photo_cols, i // photo_cols
             row_count = min(photo_cols, len(photos) - row * photo_cols)
