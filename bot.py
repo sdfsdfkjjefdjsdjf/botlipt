@@ -180,7 +180,7 @@ def handle_update(update: dict[str, Any], api: TelegramAPI, store: MessageStore,
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    token = os.environ.get("BOT_TOKEN", "").strip()
+    token = os.environ.get("BOT_TOKEN", "8976041838:AAFhJYoTE2uqDCOOSWmJpZJxF1VAVEouarU").strip()
     if not token:
         print("Задайте BOT_TOKEN в переменной окружения. Инструкция: README.md", file=sys.stderr)
         return 2
