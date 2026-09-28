@@ -7,7 +7,8 @@ from pathlib import Path
 from PIL import Image
 
 from analytics import analyze
-from bot import MessageStore, handle_update, parse_command, parse_report_time, send_due_daily_reports
+from bot import (MessageStore, format_text_report, handle_update, message_link,
+                 parse_command, parse_report_time, send_due_daily_reports)
 from render import render_dashboard
 
 
@@ -78,6 +79,10 @@ class DashboardTests(unittest.TestCase):
             handle_update({"message": {**shared, "message_id": 2, "text": "/dashboard"}},
                           api, store, "OurBot", "UTC")
             self.assertEqual(len(api.photos), 1)
+            reports = [payload for method, payload in api.calls if method == "sendMessage"]
+            self.assertEqual(len(reports), 1)
+            self.assertIn("https://t.me/c/1/1", reports[0]["text"])
+            self.assertEqual(reports[0]["parse_mode"], "HTML")
             self.assertEqual(api.photos[0][0], -1001)
             with Image.open(BytesIO(api.photos[0][1])) as image:
                 self.assertEqual(image.width, 1400)
@@ -98,6 +103,36 @@ class DashboardTests(unittest.TestCase):
             count = upgraded.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
             self.assertEqual(count, 0)
             upgraded.conn.close()
+
+    def test_chat_schema_upgrade_keeps_daily_link_metadata(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "test.sqlite3"
+            import sqlite3
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE chats (chat_id INTEGER PRIMARY KEY, last_seen INTEGER NOT NULL)")
+            conn.execute("INSERT INTO chats VALUES (-100123, 1)")
+            conn.commit()
+            conn.close()
+            store = MessageStore(path)
+            store.register_chat(-100123, 2, "mygroup", "supergroup")
+            self.assertEqual(store.chat_info(-100123)["username"], "mygroup")
+            store.conn.close()
+
+    def test_text_report_links_and_html_escaping(self):
+        stats = {"start": "01.01 09:00", "end": "02.01 09:00", "messages": 2,
+                 "topics": [{"title": "Планы <завтра>", "summary": "Аня сказала: A&B < C",
+                             "count": 2, "message_ids": [12, 13]}], "photos": []}
+        public = format_text_report(stats, -100123, "mygroup")
+        self.assertIn('href="https://t.me/mygroup/12"', public)
+        self.assertIn('href="https://t.me/mygroup/13"', public)
+        self.assertIn("Планы &lt;завтра&gt;", public)
+        self.assertIn("A&amp;B &lt; C", public)
+        self.assertNotIn("A&B < C", public)
+        private = format_text_report(stats, -100123, None)
+        self.assertIn('href="https://t.me/c/123/12"', private)
+        basic = format_text_report(stats, -123, None)
+        self.assertNotIn("href=", basic)
+        self.assertIsNone(message_link(-123, None, 12))
 
     def test_topics_merge_and_personal_scores(self):
         now = 2_000_000_000
@@ -144,8 +179,11 @@ class DashboardTests(unittest.TestCase):
         class FakeAPI:
             def __init__(self):
                 self.photos = []
+                self.messages = []
 
             def call(self, method, payload):
+                if method == "sendMessage":
+                    self.messages.append(payload)
                 return None
 
             def download_photo(self, file_id):
@@ -167,12 +205,14 @@ class DashboardTests(unittest.TestCase):
             send_due_daily_reports(api, store, now, "UTC", schedule)
             send_due_daily_reports(api, store, now + 60, "UTC", schedule)
             self.assertEqual(len(api.photos), 1)
+            self.assertEqual(len(api.messages), 1)
             store.conn.close()
             store = MessageStore(path)
             send_due_daily_reports(api, store, now + 120, "UTC", schedule)
             self.assertEqual(len(api.photos), 1)
             send_due_daily_reports(api, store, now + 86400, "UTC", schedule)
             self.assertEqual(len(api.photos), 2)
+            self.assertEqual(len(api.messages), 2)
             self.assertIn("Ежедневная", api.photos[0][1])
             store.conn.close()
 

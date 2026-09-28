@@ -153,8 +153,10 @@ def build_topics(text_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 seen_texts.add(body)
         if len(chosen) > 4:
             chosen = [chosen[0], *chosen[-3:]]
+        source_items = chosen if len(chosen) <= 3 else [chosen[0], chosen[2], chosen[-1]]
         topics.append({"title": title, "summary": describe_topic(title, chosen, cluster.get("other", False)),
-                       "count": len(items)})
+                       "count": len(items),
+                       "message_ids": [item["message_id"] for item in source_items if item.get("message_id")]})
     return topics
 
 

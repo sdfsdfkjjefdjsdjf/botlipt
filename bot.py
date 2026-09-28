@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from html import escape
 import logging
 import os
 import re
@@ -24,7 +25,7 @@ from render import render_dashboard
 
 LOG = logging.getLogger("chat_dashboard")
 HELP = (
-    "📊 /dashboard — картинка со сводкой чата за последние 24 часа.\n"
+    "📊 /dashboard — картинка и текстовая сводка за последние 24 часа со ссылками на реплики.\n"
     "🕘 Ежедневный отчёт приходит автоматически в настроенное время.\n"
     "Бот учитывает сообщения, полученные после добавления в группу. "
     "Для полного обзора сделайте его администратором либо отключите режим приватности "
@@ -123,9 +124,16 @@ class MessageStore:
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS chats (
                 chat_id INTEGER PRIMARY KEY,
-                last_seen INTEGER NOT NULL
+                last_seen INTEGER NOT NULL,
+                username TEXT,
+                chat_type TEXT
             )
         """)
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(chats)")}
+        if "username" not in columns:
+            self.conn.execute("ALTER TABLE chats ADD COLUMN username TEXT")
+        if "chat_type" not in columns:
+            self.conn.execute("ALTER TABLE chats ADD COLUMN chat_type TEXT")
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS daily_reports (
                 chat_id INTEGER NOT NULL,
@@ -168,12 +176,21 @@ class MessageStore:
         self.conn.execute("DELETE FROM daily_reports WHERE sent_at < ?", (now - 8 * WINDOW_SECONDS,))
         self.conn.commit()
 
-    def register_chat(self, chat_id: int, now: int) -> None:
+    def register_chat(self, chat_id: int, now: int, username: str | None = None,
+                      chat_type: str | None = None) -> None:
         self.conn.execute("""
-            INSERT INTO chats (chat_id, last_seen) VALUES (?, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET last_seen = excluded.last_seen
-        """, (chat_id, now))
+            INSERT INTO chats (chat_id, last_seen, username, chat_type) VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET last_seen = excluded.last_seen,
+                username = CASE WHEN excluded.chat_type IS NOT NULL
+                                THEN excluded.username ELSE chats.username END,
+                chat_type = COALESCE(excluded.chat_type, chats.chat_type)
+        """, (chat_id, now, username, chat_type))
         self.conn.commit()
+
+    def chat_info(self, chat_id: int) -> dict[str, Any]:
+        row = self.conn.execute("SELECT username, chat_type FROM chats WHERE chat_id = ?",
+                                (chat_id,)).fetchone()
+        return dict(row) if row else {}
 
     def chat_ids(self) -> list[int]:
         return [row[0] for row in self.conn.execute("SELECT chat_id FROM chats")]
@@ -214,6 +231,57 @@ def parse_report_time(value: str) -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
+def message_link(chat_id: int, username: str | None, message_id: int) -> str | None:
+    if message_id <= 0:
+        return None
+    if username and re.fullmatch(r"[A-Za-z0-9_]+", username):
+        return f"https://t.me/{username}/{message_id}"
+    # Telegram's /c/ links address private supergroups by ID without the -100 prefix.
+    if str(chat_id).startswith("-100"):
+        return f"https://t.me/c/{str(chat_id)[4:]}/{message_id}"
+    return None
+
+
+def format_text_report(stats: dict[str, Any], chat_id: int,
+                       username: str | None) -> str:
+    lines = ["<b>📜 Темы за последние 24 часа</b>",
+             f"{stats['start']}–{stats['end']} · сообщений: {stats['messages']}"
+             f" · фото: {stats.get('photo_count', len(stats['photos']))}", ""]
+    if not stats["topics"]:
+        lines.append("Пока нет текстовых сообщений для обзора.")
+    for index, topic in enumerate(stats["topics"], 1):
+        ids = topic.get("message_ids", [])[:3]
+        link = message_link(chat_id, username, ids[0]) if ids else None
+        title = escape(f"{index}. {topic['title']}")
+        heading = f'<a href="{link}"><b>{title}</b></a>' if link else f"<b>{title}</b>"
+        lines.append(f"{heading} · {topic['count']} сообщ.")
+        lines.append(escape(topic["summary"]))
+        source_links = [f'<a href="{url}">↗ реплика {number}</a>'
+                        for number, message_id in enumerate(ids, 1)
+                        if (url := message_link(chat_id, username, message_id))]
+        if source_links:
+            lines.append(" · ".join(source_links))
+        lines.append("")
+    photo_links = [f'<a href="{url}">фото {number}</a>'
+                   for number, photo in enumerate(stats["photos"][:3], 1)
+                   if (url := message_link(chat_id, username, photo["message_id"]))]
+    if photo_links:
+        lines.append("📷 " + " · ".join(photo_links))
+    authors = stats.get("authors", [])[:3]
+    if authors:
+        lines.append("<b>Активные:</b> " + ", ".join(
+            f"{escape(item['name'])} — {item['count']}" for item in authors))
+    words = stats.get("words", [])[:8]
+    if words:
+        lines.append("<b>Частые слова:</b> " + ", ".join(
+            f"{escape(word)} ({count})" for word, count in words))
+    if stats.get("average_score") is not None:
+        lines.append(f"<b>Игровой балл текста:</b> {stats['average_score']}")
+    if username is None and not str(chat_id).startswith("-100") and stats["topics"]:
+        lines.append("Ссылки на реплики появятся после перехода группы в супергруппу.")
+    return "\n".join(lines).strip()
+
+
 def send_dashboard(api: TelegramAPI, store: MessageStore, chat_id: int,
                    now: int, tz_name: str, daily: bool = False) -> None:
     api.call("sendChatAction", {"chat_id": chat_id, "action": "upload_photo"})
@@ -222,6 +290,15 @@ def send_dashboard(api: TelegramAPI, store: MessageStore, chat_id: int,
     png = render_dashboard(stats, photos)
     caption = "📊 Ежедневная сводка за 24 часа" if daily else "📊 Сводка за последние 24 часа"
     api.send_photo(chat_id, png, caption)
+    chat_info = store.chat_info(chat_id)
+    try:
+        api.call("sendMessage", {"chat_id": chat_id,
+                                 "text": format_text_report(stats, chat_id, chat_info.get("username")),
+                                 "parse_mode": "HTML",
+                                 "link_preview_options": json.dumps({"is_disabled": True})})
+    except Exception:
+        # The image is already delivered. Avoid duplicating it on the next daily retry.
+        LOG.exception("Could not send text report to chat %s", chat_id)
     LOG.info("Sent %s dashboard to chat %s: %s messages",
              "daily" if daily else "manual", chat_id, stats["messages"])
 
@@ -260,7 +337,7 @@ def handle_update(update: dict[str, Any], api: TelegramAPI, store: MessageStore,
 
     now = int(time.time())
     store.prune(now)
-    store.register_chat(chat["id"], now)
+    store.register_chat(chat["id"], now, chat.get("username"), chat.get("type"))
     command = parse_command(msg.get("text") or "", bot_username)
     if command in {"dashboard", "report"}:
         send_dashboard(api, store, chat["id"], now, tz_name)
@@ -272,7 +349,7 @@ def handle_update(update: dict[str, Any], api: TelegramAPI, store: MessageStore,
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    token = os.environ.get("BOT_TOKEN", "8976041838:AAFhJYoTE2uqDCOOSWmJpZJxF1VAVEouarU").strip()
+    token = os.environ.get("BOT_TOKEN", "").strip()
     if not token:
         print("Задайте BOT_TOKEN в переменной окружения. Инструкция: README.md", file=sys.stderr)
         return 2
