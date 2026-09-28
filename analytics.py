@@ -41,8 +41,12 @@ REASON_MARKERS = (
 )
 PROPOSAL_RE = re.compile(r"\b(?:предлагаю|давайте|можно|нужно|стоит|мб|может|попробуем)\b")
 AGREEMENT_RE = re.compile(r"^\s*(?:да[,! ]|согласен\b|согласна\b|поддерживаю\b|точно\b)")
-TOPIC_FILLERS = {"прикольный", "может", "сможет", "сделает", "сделать", "давайте",
-                 "использовать", "хороший", "хорошую", "сегодня", "первый", "весь"}
+TOPIC_PREFIX_RE = re.compile(
+    r"^(?:(?:ну|короче|кстати|слушайте|ребята|друзья|согласна|согласен|"
+    r"да|ага|точно|окей|мне кажется|я думаю|я считаю|думаю|хочу обсудить|"
+    r"давайте обсудим|говорили о)\b[\s,:—–-]*)+",
+    re.IGNORECASE,
+)
 
 
 def tokens(text: str) -> list[str]:
@@ -63,6 +67,36 @@ def stem(word: str) -> str:
 def clip(text: str, limit: int) -> str:
     text = " ".join(text.split())
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def message_count_label(count: int) -> str:
+    ending = "сообщение" if count % 10 == 1 and count % 100 != 11 else (
+        "сообщения" if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14)
+        else "сообщений")
+    return f"{count} {ending}"
+
+
+def topic_title(items: list[dict[str, Any]]) -> str:
+    """Choose a readable source-grounded heading instead of a list of keywords."""
+    frequencies = Counter(stem(word) for item in items for word in tokens(item.get("text") or ""))
+    candidates = []
+    for index, item in enumerate(items):
+        body = " ".join(URL_RE.sub("", item.get("text") or "").split())
+        body = TOPIC_PREFIX_RE.sub("", body).strip(" \t.,:;—–-")
+        if not body:
+            continue
+        sentence = re.split(r"(?<=[.!?])\s+|\n", body, maxsplit=1)[0].strip()
+        title = clip(sentence.rstrip(".!? "), 88)
+        if len(title) < 8:
+            continue
+        terms = {stem(word) for word in tokens(title)}
+        relevance = sum(frequencies[word] for word in terms)
+        length_bonus = 3 if 20 <= len(title) <= 75 else 0
+        candidates.append((relevance + length_bonus, -index, title))
+    if not candidates:
+        return "Обсуждение"
+    title = max(candidates)[2]
+    return title[0].upper() + title[1:]
 
 
 def describe_topic(title: str, items: list[dict[str, Any]], other: bool = False) -> str:
@@ -128,10 +162,10 @@ def build_topics(text_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             cluster["last_date"] = msg["date"]
 
     clusters.sort(key=lambda c: (-len(c["items"]), -c["last_date"]))
-    if len(clusters) > 3:
-        overflow = clusters[3:]
+    if len(clusters) > 9:
+        overflow = clusters[9:]
         rest = sorted((msg for group in overflow for msg in group["items"]), key=lambda m: m["date"])
-        clusters = clusters[:3] + [{"items": rest, "terms": set(), "last_date": rest[-1]["date"],
+        clusters = clusters[:9] + [{"items": rest, "terms": set(), "last_date": rest[-1]["date"],
                                     "other": True}]
 
     topics = []
@@ -140,10 +174,7 @@ def build_topics(text_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if cluster.get("other"):
             title = "Другие темы"
         else:
-            counts = Counter(word for item in items for word in tokens(item.get("text") or "")
-                             if word not in TOPIC_FILLERS)
-            title = " · ".join(word.capitalize() if i == 0 else word
-                               for i, (word, _) in enumerate(counts.most_common(3))) or "Обсуждение"
+            title = topic_title(items)
         chosen = []
         seen_texts = set()
         for item in sorted(items, key=lambda m: m["date"]):
@@ -249,6 +280,11 @@ def analyze(messages: list[dict[str, Any]], now: int, tz_name: str = "UTC") -> d
         "topics": build_topics(text_messages),
         "participant_scores": scores,
         "average_score": round(mean(item["score"] for item in scores)) if scores else None,
-        "photos": photos[-6:][::-1],
+        "photos": sorted(
+            photos,
+            key=lambda item: (int(item.get("reaction_count") or 0) + int(item.get("reply_count") or 0),
+                              int(item.get("reaction_count") or 0), item["date"], item["message_id"]),
+            reverse=True,
+        )[:6],
         "hourly": hourly,
     }

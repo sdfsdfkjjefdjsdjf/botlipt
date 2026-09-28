@@ -94,7 +94,9 @@ class DashboardTests(unittest.TestCase):
             path = Path(folder) / "test.sqlite3"
             store = MessageStore(path)
             store.conn.execute("""
-                INSERT INTO messages VALUES (-1001, 1, 2000000000, '1', 'Бот', '', NULL)
+                INSERT INTO messages
+                    (chat_id, message_id, date, sender_id, sender_name, text, photo_file_id)
+                VALUES (-1001, 1, 2000000000, '1', 'Бот', '', NULL)
             """)
             store.conn.execute("PRAGMA user_version = 0")
             store.conn.commit()
@@ -116,6 +118,67 @@ class DashboardTests(unittest.TestCase):
             store = MessageStore(path)
             store.register_chat(-100123, 2, "mygroup", "supergroup")
             self.assertEqual(store.chat_info(-100123)["username"], "mygroup")
+            store.conn.close()
+
+    def test_existing_message_database_adds_reply_column(self):
+        import sqlite3
+        now = 2_000_000_000
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "test.sqlite3"
+            conn = sqlite3.connect(path)
+            conn.execute("""CREATE TABLE messages (
+                chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, date INTEGER NOT NULL,
+                sender_id TEXT NOT NULL, sender_name TEXT NOT NULL, text TEXT NOT NULL,
+                photo_file_id TEXT, PRIMARY KEY (chat_id, message_id))""")
+            conn.execute("INSERT INTO messages VALUES (-100123, 1, ?, '1', 'Аня', '', 'photo')",
+                         (now - 20,))
+            conn.commit()
+            conn.close()
+            store = MessageStore(path)
+            store.upsert({"chat": {"id": -100123}, "message_id": 2, "date": now - 10,
+                          "from": {"id": 2, "first_name": "Борис"}, "text": "Отлично!",
+                          "reply_to_message": {"message_id": 1}})
+            self.assertEqual(store.recent(-100123, now)[0]["reply_count"], 1)
+            store.conn.close()
+
+    def test_photo_ranking_uses_reactions_and_direct_replies(self):
+        now = 2_000_000_000
+        chat = {"id": -100123, "type": "supergroup"}
+        with tempfile.TemporaryDirectory() as folder:
+            store = MessageStore(Path(folder) / "test.sqlite3")
+            for message_id in (1, 2, 3):
+                store.upsert({"chat": chat, "message_id": message_id,
+                              "date": now - 200 + message_id,
+                              "from": {"id": 10, "first_name": "Аня"},
+                              "photo": [{"width": 640, "height": 640,
+                                         "file_id": f"photo-{message_id}"}]})
+            for message_id in (4, 5):
+                store.upsert({"chat": chat, "message_id": message_id,
+                              "date": now - 100 + message_id,
+                              "from": {"id": message_id, "first_name": "Борис"},
+                              "text": "Классная фотография!",
+                              "reply_to_message": {"message_id": 2}})
+            first_reaction = {"chat": chat, "message_id": 1, "user": {"id": 20},
+                              "new_reaction": [{"type": "emoji"}, {"type": "emoji"}]}
+            handle_update({"message_reaction": first_reaction}, None, store, "OurBot", "UTC")
+            handle_update({"message_reaction": first_reaction}, None, store, "OurBot", "UTC")
+            handle_update({"message_reaction": {**first_reaction, "user": {"id": 21},
+                                                "new_reaction": [{"type": "emoji"}]}},
+                          None, store, "OurBot", "UTC")
+            totals = {"chat": chat, "message_id": 2,
+                      "reactions": [{"total_count": 2}]}
+            handle_update({"message_reaction_count": totals}, None, store, "OurBot", "UTC")
+            handle_update({"message_reaction_count": totals}, None, store, "OurBot", "UTC")
+            stats = analyze(store.recent(chat["id"], now), now)
+            self.assertEqual([photo["message_id"] for photo in stats["photos"]], [2, 1, 3])
+            self.assertEqual((stats["photos"][0]["reaction_count"],
+                              stats["photos"][0]["reply_count"]), (2, 2))
+            self.assertEqual(stats["photos"][1]["reaction_count"], 3)
+            report = format_text_report(stats, chat["id"], None)
+            self.assertIn("фото 1</a> (♥ 2, ответов 2)", report)
+            store.prune(now + 86_401)
+            self.assertEqual(store.conn.execute("SELECT COUNT(*) FROM photo_reactions").fetchone()[0], 0)
+            self.assertEqual(store.conn.execute("SELECT COUNT(*) FROM photo_reaction_totals").fetchone()[0], 0)
             store.conn.close()
 
     def test_text_report_links_and_html_escaping(self):
@@ -156,6 +219,26 @@ class DashboardTests(unittest.TestCase):
                             for item in stats["topics"]))
         self.assertEqual(len(stats["participant_scores"]), 2)
         self.assertIsNotNone(stats["average_score"])
+
+    def test_topic_list_shows_more_themes_with_clickable_counts(self):
+        now = 2_000_000_000
+        bodies = [
+            "Обсуждение наркотиков и зависимости в обществе",
+            "Ситуация с Telegram в России и доступом к нему",
+            "Конфликт между участниками из-за оскорблений",
+            "Государственная политика и исторические события",
+            "Поездки за границу и оформление виз",
+        ]
+        messages = [{"date": now - 1000 + index * 100, "message_id": index + 1,
+                     "sender_id": "1", "sender_name": "Аня", "text": body,
+                     "photo_file_id": None} for index, body in enumerate(bodies)]
+        stats = analyze(messages, now)
+        self.assertEqual(len(stats["topics"]), len(bodies))
+        report = format_text_report(stats, -100123, None)
+        self.assertEqual(report.count("(1 сообщение)"), len(bodies))
+        for message_id in range(1, len(bodies) + 1):
+            self.assertIn(f'https://t.me/c/123/{message_id}', report)
+        self.assertTrue(all(" · " not in item["title"] for item in stats["topics"]))
 
     def test_reasoned_dialogue_scores_above_repetition(self):
         now = 2_000_000_000

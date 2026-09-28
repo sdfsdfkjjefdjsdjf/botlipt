@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
+from analytics import message_count_label
 
 
 WIDTH = 1400
@@ -108,6 +109,12 @@ def photo_tile(canvas: Image.Image, draw: ImageDraw.ImageDraw, box: tuple[int, i
     if not raw:
         draw.rounded_rectangle(box, radius=16, fill=CARD_ALT)
         draw.text((x1 + 24, y1 + 75), "Фото недоступно", font=font(24), fill=MUTED)
+    engagement = f"♥ {info.get('reaction_count', 0)} · ответы {info.get('reply_count', 0)}"
+    badge_width = text_width(draw, engagement, font(19, True)) + 26
+    draw.rounded_rectangle((x2 - badge_width - 12, y1 + 12, x2 - 12, y1 + 47),
+                           radius=12, fill=(8, 17, 31, 220))
+    draw.text((x2 - badge_width + 1, y1 + 19), engagement,
+              font=font(19, True), fill=WHITE)
     overlay = Image.new("RGBA", (w, 58), (8, 17, 31, 220))
     canvas.paste(overlay, (x1, y2 - 58), overlay)
     label = info.get("sender_name") or "Участник"
@@ -123,12 +130,18 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
     photo_bytes = photo_bytes or []
     measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     topics = stats.get("topics", [])
-    topic_layout = []
+    topic_rows = []
     for item in topics:
-        lines = wrap_lines(measure, item["summary"], font(23), 1200, 6)
-        topic_layout.append((item, lines, max(112, 70 + len(lines) * 30)))
-    topic_height = 80 + sum(row[2] for row in topic_layout) + max(0, len(topic_layout) - 1) * 12 + 23
-    if not topic_layout:
+        lines = wrap_lines(measure, item["title"], font(23, True), 960, 2)
+        topic_rows.append((item, lines, max(52, 18 + len(lines) * 30)))
+    detail_rows = []
+    for item in topics[:3]:
+        lines = wrap_lines(measure, item["summary"], font(22), 1190, 5)
+        detail_rows.append((item, lines, max(106, 65 + len(lines) * 29)))
+    list_height = sum(row[2] + 8 for row in topic_rows)
+    detail_height = (57 + sum(row[2] + 10 for row in detail_rows)) if detail_rows else 0
+    topic_height = 75 + list_height + detail_height + 20
+    if not topic_rows:
         topic_height = 185
     topic_y = 294
     lower_y = topic_y + topic_height + 18
@@ -164,23 +177,30 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
 
     card(draw, (44, topic_y, 1356, topic_y + topic_height))
     draw.text((70, topic_y + 23), "Что обсуждали", font=font(30, True), fill=WHITE)
-    draw.text((1327 - text_width(draw, "Похожие сообщения объединены", font(17)), topic_y + 32),
-              "Похожие сообщения объединены", font=font(17), fill=MUTED)
-    if not topic_layout:
+    draw.text((1327 - text_width(draw, "Темы за 24 часа", font(17)), topic_y + 32),
+              "Темы за 24 часа", font=font(17), fill=MUTED)
+    if not topic_rows:
         draw.text((72, topic_y + 102), "Пока нет текстовых сообщений для обзора", font=font(24), fill=MUTED)
     else:
         y = topic_y + 73
-        for index, (item, lines, row_height) in enumerate(topic_layout):
+        for index, (item, lines, row_height) in enumerate(topic_rows):
             card(draw, (70, y, 1330, y + row_height), CARD_ALT)
-            draw.ellipse((88, y + 22, 100, y + 34), fill=[CYAN, ORANGE, GREEN, "#C4B7F3"][index % 4])
-            title = fit_text(draw, item["title"], font(23, True), 980)
-            draw.text((113, y + 12), title, font=font(23, True), fill=WHITE)
-            count_label = f"{item['count']} сообщ."
+            draw.ellipse((88, y + 20, 100, y + 32), fill=[CYAN, ORANGE, GREEN, "#C4B7F3"][index % 4])
+            for line_index, line in enumerate(lines):
+                draw.text((113, y + 8 + line_index * 30), line, font=font(23, True), fill=WHITE)
+            count_label = message_count_label(item["count"])
             draw.text((1304 - text_width(draw, count_label, font(18)), y + 16),
                       count_label, font=font(18), fill=MUTED)
+            y += row_height + 8
+        draw.text((72, y + 11), "Подробнее о главных темах", font=font(23, True), fill=CYAN)
+        y += 57
+        for index, (item, lines, row_height) in enumerate(detail_rows):
+            card(draw, (70, y, 1330, y + row_height), CARD_ALT)
+            draw.text((91, y + 10), fit_text(draw, item["title"], font(20, True), 1180),
+                      font=font(20, True), fill=WHITE)
             for line_index, line in enumerate(lines):
-                draw.text((91, y + 49 + line_index * 29), line, font=font(23), fill="#D9E4F0")
-            y += row_height + 12
+                draw.text((91, y + 42 + line_index * 29), line, font=font(22), fill="#D9E4F0")
+            y += row_height + 10
 
     boxes = [(44, 468), (485, 923), (940, 1356)]
     for x1, x2 in boxes:

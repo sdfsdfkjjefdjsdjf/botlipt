@@ -19,13 +19,14 @@ from urllib.request import Request, urlopen
 import uuid
 from zoneinfo import ZoneInfo
 
-from analytics import WINDOW_SECONDS, analyze
+from analytics import WINDOW_SECONDS, analyze, message_count_label
 from render import render_dashboard
 
 
 LOG = logging.getLogger("chat_dashboard")
 HELP = (
     "📊 /dashboard — картинка и текстовая сводка за последние 24 часа со ссылками на реплики.\n"
+    "📷 Фото выбираются по сумме реакций и ответов; для учёта реакций бот должен быть администратором.\n"
     "🕘 Ежедневный отчёт приходит автоматически в настроенное время.\n"
     "Бот учитывает сообщения, полученные после добавления в группу. "
     "Для полного обзора сделайте его администратором либо отключите режим приватности "
@@ -117,10 +118,33 @@ class MessageStore:
                 sender_name TEXT NOT NULL,
                 text TEXT NOT NULL,
                 photo_file_id TEXT,
+                reply_to_message_id INTEGER,
                 PRIMARY KEY (chat_id, message_id)
             )
         """)
         self.conn.execute("CREATE INDEX IF NOT EXISTS messages_date_idx ON messages(date)")
+        message_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(messages)")}
+        if "reply_to_message_id" not in message_columns:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN reply_to_message_id INTEGER")
+        self.conn.execute("""CREATE INDEX IF NOT EXISTS messages_reply_idx
+                             ON messages(chat_id, reply_to_message_id)""")
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS photo_reactions (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                actor_key TEXT NOT NULL,
+                reaction_count INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, message_id, actor_key)
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS photo_reaction_totals (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                reaction_count INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
+            )
+        """)
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS chats (
                 chat_id INTEGER PRIMARY KEY,
@@ -163,16 +187,60 @@ class MessageStore:
         photos = msg.get("photo") or []
         photo = min(photos, key=lambda p: abs(max(p.get("width", 0), p.get("height", 0)) - 640)) if photos else None
         body = msg.get("text") or msg.get("caption") or ""
+        reply_to_message_id = (msg.get("reply_to_message") or {}).get("message_id")
         self.conn.execute("""
             INSERT OR REPLACE INTO messages
-                (chat_id, message_id, date, sender_id, sender_name, text, photo_file_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (chat_id, message_id, date, sender_id, sender_name, text,
+                 photo_file_id, reply_to_message_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (chat["id"], msg["message_id"], msg["date"], sender_id,
-              sender_name, body, photo.get("file_id") if photo else None))
+              sender_name, body, photo.get("file_id") if photo else None,
+              reply_to_message_id))
         self.conn.commit()
+
+    def set_actor_reactions(self, chat_id: int, message_id: int, actor_key: str,
+                            count: int) -> None:
+        if not self._has_photo(chat_id, message_id):
+            return
+        if count:
+            self.conn.execute("""
+                INSERT INTO photo_reactions VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id, message_id, actor_key)
+                DO UPDATE SET reaction_count = excluded.reaction_count
+            """, (chat_id, message_id, actor_key, count))
+        else:
+            self.conn.execute("""
+                DELETE FROM photo_reactions
+                WHERE chat_id = ? AND message_id = ? AND actor_key = ?
+            """, (chat_id, message_id, actor_key))
+        self.conn.commit()
+
+    def set_anonymous_reactions(self, chat_id: int, message_id: int, count: int) -> None:
+        if not self._has_photo(chat_id, message_id):
+            return
+        self.conn.execute("""
+            INSERT INTO photo_reaction_totals VALUES (?, ?, ?)
+            ON CONFLICT(chat_id, message_id)
+            DO UPDATE SET reaction_count = excluded.reaction_count
+        """, (chat_id, message_id, count))
+        self.conn.commit()
+
+    def _has_photo(self, chat_id: int, message_id: int) -> bool:
+        return self.conn.execute("""
+            SELECT 1 FROM messages WHERE chat_id = ? AND message_id = ?
+            AND photo_file_id IS NOT NULL
+        """, (chat_id, message_id)).fetchone() is not None
 
     def prune(self, now: int) -> None:
         self.conn.execute("DELETE FROM messages WHERE date < ?", (now - WINDOW_SECONDS,))
+        for table in ("photo_reactions", "photo_reaction_totals"):
+            self.conn.execute(f"""
+                DELETE FROM {table} WHERE NOT EXISTS (
+                    SELECT 1 FROM messages
+                    WHERE messages.chat_id = {table}.chat_id
+                    AND messages.message_id = {table}.message_id
+                )
+            """)
         self.conn.execute("DELETE FROM daily_reports WHERE sent_at < ?", (now - 8 * WINDOW_SECONDS,))
         self.conn.commit()
 
@@ -211,7 +279,25 @@ class MessageStore:
             SELECT * FROM messages WHERE chat_id = ? AND date BETWEEN ? AND ?
             ORDER BY date, message_id
         """, (chat_id, now - WINDOW_SECONDS, now)).fetchall()
-        return [dict(row) for row in rows]
+        messages = [dict(row) for row in rows]
+        replies = dict(self.conn.execute("""
+            SELECT reply_to_message_id, COUNT(*) FROM messages
+            WHERE chat_id = ? AND date BETWEEN ? AND ?
+            AND reply_to_message_id IS NOT NULL GROUP BY reply_to_message_id
+        """, (chat_id, now - WINDOW_SECONDS, now)))
+        individual = dict(self.conn.execute("""
+            SELECT message_id, SUM(reaction_count) FROM photo_reactions
+            WHERE chat_id = ? GROUP BY message_id
+        """, (chat_id,)))
+        anonymous = dict(self.conn.execute("""
+            SELECT message_id, reaction_count FROM photo_reaction_totals WHERE chat_id = ?
+        """, (chat_id,)))
+        for msg in messages:
+            if msg["photo_file_id"]:
+                msg["reply_count"] = replies.get(msg["message_id"], 0)
+                msg["reaction_count"] = max(individual.get(msg["message_id"], 0),
+                                            anonymous.get(msg["message_id"], 0))
+        return messages
 
 
 def parse_command(text: str, bot_username: str) -> str | None:
@@ -244,17 +330,22 @@ def message_link(chat_id: int, username: str | None, message_id: int) -> str | N
 
 def format_text_report(stats: dict[str, Any], chat_id: int,
                        username: str | None) -> str:
-    lines = ["<b>📜 Темы за последние 24 часа</b>",
+    lines = ["<b>📅 Что обсуждали за последние 24 часа</b>",
              f"{stats['start']}–{stats['end']} · сообщений: {stats['messages']}"
              f" · фото: {stats.get('photo_count', len(stats['photos']))}", ""]
     if not stats["topics"]:
         lines.append("Пока нет текстовых сообщений для обзора.")
     for index, topic in enumerate(stats["topics"], 1):
-        ids = topic.get("message_ids", [])[:3]
+        ids = topic.get("message_ids", [])
         link = message_link(chat_id, username, ids[0]) if ids else None
-        title = escape(f"{index}. {topic['title']}")
+        title = escape(topic["title"])
         heading = f'<a href="{link}"><b>{title}</b></a>' if link else f"<b>{title}</b>"
-        lines.append(f"{heading} · {topic['count']} сообщ.")
+        lines.append(f"{index}. {heading} ({message_count_label(topic['count'])})")
+    if stats["topics"]:
+        lines.extend(["", "<b>Подробнее о главных темах</b>"])
+    for topic in stats["topics"][:3]:
+        ids = topic.get("message_ids", [])[:3]
+        lines.append(f"<b>{escape(topic['title'])}</b>")
         lines.append(escape(topic["summary"]))
         source_links = [f'<a href="{url}">↗ реплика {number}</a>'
                         for number, message_id in enumerate(ids, 1)
@@ -263,6 +354,7 @@ def format_text_report(stats: dict[str, Any], chat_id: int,
             lines.append(" · ".join(source_links))
         lines.append("")
     photo_links = [f'<a href="{url}">фото {number}</a>'
+                   f" (♥ {photo.get('reaction_count', 0)}, ответов {photo.get('reply_count', 0)})"
                    for number, photo in enumerate(stats["photos"][:3], 1)
                    if (url := message_link(chat_id, username, photo["message_id"]))]
     if photo_links:
@@ -325,6 +417,26 @@ def send_due_daily_reports(api: TelegramAPI, store: MessageStore, now: int,
 
 def handle_update(update: dict[str, Any], api: TelegramAPI, store: MessageStore,
                   bot_username: str, tz_name: str) -> None:
+    reaction = update.get("message_reaction")
+    if reaction:
+        chat = reaction.get("chat") or {}
+        if chat.get("type") in {"group", "supergroup"}:
+            actor = reaction.get("user") or {}
+            actor_chat = reaction.get("actor_chat") or {}
+            actor_key = (f"user:{actor['id']}" if actor.get("id") is not None else
+                         f"chat:{actor_chat['id']}" if actor_chat.get("id") is not None else None)
+            if actor_key:
+                store.set_actor_reactions(chat["id"], reaction["message_id"], actor_key,
+                                          len(reaction.get("new_reaction") or []))
+        return
+    reaction_totals = update.get("message_reaction_count")
+    if reaction_totals:
+        chat = reaction_totals.get("chat") or {}
+        if chat.get("type") in {"group", "supergroup"}:
+            count = sum(max(0, int(item.get("total_count", 0)))
+                        for item in reaction_totals.get("reactions") or [])
+            store.set_anonymous_reactions(chat["id"], reaction_totals["message_id"], count)
+        return
     msg = update.get("message") or update.get("edited_message")
     if not msg:
         return
@@ -365,7 +477,12 @@ def main() -> int:
              username, tz_name, *report_time, db_path)
     while True:
         try:
-            payload: dict[str, Any] = {"timeout": 30, "allowed_updates": '["message","edited_message"]'}
+            payload: dict[str, Any] = {
+                "timeout": 30,
+                "allowed_updates": json.dumps([
+                    "message", "edited_message", "message_reaction", "message_reaction_count"
+                ]),
+            }
             if offset is not None:
                 payload["offset"] = offset
             updates = api.call("getUpdates", payload, timeout=45)

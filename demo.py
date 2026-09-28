@@ -48,6 +48,8 @@ def main() -> None:
             "sender_name": people[i % 5],
             "text": texts[(i * 7) % len(texts)],
             "photo_file_id": f"sample-{i}" if i in {8, 20, 33, 42} else None,
+            "reaction_count": {8: 5, 20: 2, 33: 9, 42: 3}.get(i, 0),
+            "reply_count": {8: 2, 20: 4, 33: 1, 42: 0}.get(i, 0),
         })
     stats = analyze(messages, now, "Asia/Qyzylorda")
     pictures = [sample_photo(i) for i, _ in enumerate(stats["photos"])]
