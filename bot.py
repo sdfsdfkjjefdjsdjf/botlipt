@@ -26,6 +26,7 @@ from render import render_dashboard
 LOG = logging.getLogger("chat_dashboard")
 HELP = (
     "📊 /dashboard — картинка и текстовая сводка за последние 24 часа со ссылками на реплики.\n"
+    "🛡 /banadmins — снять и забанить всех доступных боту администраторов супергруппы; только для владельца.\n"
     "📷 Фото выбираются по сумме реакций и ответов; для учёта реакций бот должен быть администратором.\n"
     "🕘 Ежедневный отчёт приходит автоматически в настроенное время.\n"
     "Бот учитывает сообщения, полученные после добавления в группу. "
@@ -317,6 +318,101 @@ def parse_report_time(value: str) -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
+def send_moderation_report(api: TelegramAPI, chat_id: int, lines: list[str]) -> None:
+    # Split at line boundaries and leave room below Telegram's 4096-character limit.
+    part = ""
+    for line in lines:
+        if len(part) + len(line) + 1 > 3500:
+            api.call("sendMessage", {"chat_id": chat_id, "text": part.rstrip()})
+            part = ""
+        part += line + "\n"
+    if part:
+        api.call("sendMessage", {"chat_id": chat_id, "text": part.rstrip()})
+
+
+def ban_admins(api: TelegramAPI, msg: dict[str, Any]) -> None:
+    """Demote and permanently ban editable admins on the chat owner's command."""
+    chat_id = msg["chat"]["id"]
+
+    def reply(text: str) -> None:
+        api.call("sendMessage", {"chat_id": chat_id, "text": text})
+
+    if msg["chat"].get("type") != "supergroup":
+        reply("/banadmins работает только в супергруппе.")
+        return
+    actor_id = (msg.get("from") or {}).get("id")
+    if msg.get("sender_chat") or actor_id is None:
+        reply("Отправьте /banadmins от личного аккаунта владельца, без анонимного режима.")
+        return
+    try:
+        actor = api.call("getChatMember", {"chat_id": chat_id, "user_id": actor_id})
+        if actor.get("status") != "creator":
+            reply("/banadmins доступна только владельцу группы.")
+            return
+        bot_id = api.call("getMe")["id"]
+        bot_member = api.call("getChatMember", {"chat_id": chat_id, "user_id": bot_id})
+        if (bot_member.get("status") != "administrator"
+                or not bot_member.get("can_promote_members")
+                or not bot_member.get("can_restrict_members")):
+            reply("Боту нужны права администратора: «Добавление администраторов» "
+                  "и «Блокировка пользователей».")
+            return
+        admins = api.call("getChatAdministrators", {"chat_id": chat_id, "return_bots": "true"})
+    except (TelegramAPIError, URLError, TimeoutError, OSError):
+        LOG.exception("Could not check /banadmins permissions in chat %s", chat_id)
+        reply("Не удалось проверить права или получить список администраторов. Команда не выполнена.")
+        return
+
+    # The Bot API requires every boolean privilege to be false for demotion.
+    demotion = dict.fromkeys((
+        "is_anonymous", "can_manage_chat", "can_delete_messages", "can_manage_video_chats",
+        "can_restrict_members", "can_promote_members", "can_change_info", "can_invite_users",
+        "can_post_stories", "can_edit_stories", "can_delete_stories", "can_post_messages",
+        "can_edit_messages", "can_pin_messages", "can_manage_topics", "can_manage_direct_messages",
+        "can_manage_tags", "can_send_welcome_messages",
+    ), "false")
+    banned = skipped = failed = 0
+    lines = []
+    for admin in admins:
+        user = admin["user"]
+        user_id = user["id"]
+        name = " ".join(str(user.get("first_name") or user.get("username") or user_id).split())[:200]
+        label = f"{name} (ID {user_id})"
+        if user_id == bot_id or admin.get("status") == "creator":
+            skipped += 1
+            lines.append(f"⏭ {label}: владелец группы или сам бот.")
+            continue
+        demoted = False
+        try:
+            # Refresh the snapshot before changing privileges: ownership/rights can change.
+            member = api.call("getChatMember", {"chat_id": chat_id, "user_id": user_id})
+            if member.get("status") != "administrator" or not member.get("can_be_edited"):
+                skipped += 1
+                lines.append(f"⏭ {label}: уже не администратор или Telegram запрещает снятие прав.")
+                continue
+            result = api.call("promoteChatMember", {"chat_id": chat_id, "user_id": user_id, **demotion})
+            if result is not True:
+                raise TelegramAPIError("Telegram не подтвердил снятие прав")
+            demoted = True
+            result = api.call("banChatMember", {
+                "chat_id": chat_id, "user_id": user_id, "revoke_messages": "true",
+            })
+            if result is not True:
+                raise TelegramAPIError("Telegram не подтвердил бан")
+            banned += 1
+            lines.append(f"✅ {label}: админка снята, пользователь забанен.")
+            LOG.info("Owner %s demoted and banned admin %s in chat %s", actor_id, user_id, chat_id)
+        except (TelegramAPIError, URLError, TimeoutError, OSError):
+            failed += 1
+            LOG.exception("Could not demote/ban admin %s in chat %s", user_id, chat_id)
+            detail = ("Админка снята, но бан не подтверждён; проверьте участника."
+                      if demoted else "Снятие админки не подтверждено; бан не выполнялся.")
+            lines.append(f"❌ {label}: {detail}")
+    send_moderation_report(api, chat_id, [
+        f"/banadmins: забанено {banned}, пропущено {skipped}, ошибок {failed}.", *lines,
+    ])
+
+
 def message_link(chat_id: int, username: str | None, message_id: int) -> str | None:
     if message_id <= 0:
         return None
@@ -432,7 +528,7 @@ def handle_update(update: dict[str, Any], api: TelegramAPI, store: MessageStore,
         return
     chat = msg.get("chat") or {}
     if chat.get("type") not in {"group", "supergroup"}:
-        if parse_command(msg.get("text") or "", bot_username) in {"start", "help", "dashboard"}:
+        if parse_command(msg.get("text") or "", bot_username) in {"start", "help", "dashboard", "banadmins"}:
             api.call("sendMessage", {"chat_id": chat["id"], "text":
                      "Добавьте меня в группу. Там команда /dashboard покажет сводку за последние 24 часа.\n\n" + HELP})
         return
@@ -441,7 +537,11 @@ def handle_update(update: dict[str, Any], api: TelegramAPI, store: MessageStore,
     store.prune(now)
     store.register_chat(chat["id"], now, chat.get("username"), chat.get("type"))
     command = parse_command(msg.get("text") or "", bot_username)
-    if command in {"dashboard", "report"}:
+    if command == "banadmins":
+        # Editing an old message must never trigger a moderation operation.
+        if update.get("message"):
+            ban_admins(api, msg)
+    elif command in {"dashboard", "report"}:
         send_dashboard(api, store, chat["id"], now, tz_name)
     elif command in {"start", "help"}:
         api.call("sendMessage", {"chat_id": chat["id"], "text": HELP})
