@@ -346,9 +346,6 @@ def ban_admins(api: TelegramAPI, msg: dict[str, Any]) -> None:
         return
     try:
         actor = api.call("getChatMember", {"chat_id": chat_id, "user_id": actor_id})
-        if actor.get("status") != "user":
-            reply("/banadmins доступна только владельцу группы.")
-            return
         bot_id = api.call("getMe")["id"]
         bot_member = api.call("getChatMember", {"chat_id": chat_id, "user_id": bot_id})
         if (bot_member.get("status") != "administrator"
