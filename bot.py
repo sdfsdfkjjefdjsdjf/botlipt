@@ -21,11 +21,14 @@ from zoneinfo import ZoneInfo
 
 from analytics import WINDOW_SECONDS, analyze, message_count_label
 from render import render_dashboard
+from topics import clip
 
 
 LOG = logging.getLogger("chat_dashboard")
 HELP = (
     "📊 /dashboard — картинка и текстовая сводка за последние 24 часа со ссылками на реплики.\n"
+    "💬 Темы: краткое содержание, ключевые слова и участники обсуждения.\n"
+    "🧠 IQ* — игровой балл текста с разбором показателей и достаточности данных.\n"
     "🛡 /banadmins — снять и забанить всех доступных боту администраторов супергруппы; только для владельца.\n"
     "📷 Фото выбираются по сумме реакций и ответов; для учёта реакций бот должен быть администратором.\n"
     "🕘 Ежедневный отчёт приходит автоматически в настроенное время.\n"
@@ -431,9 +434,20 @@ def format_text_report(stats: dict[str, Any], chat_id: int,
     for index, topic in enumerate(stats["topics"], 1):
         ids = topic.get("message_ids", [])
         link = message_link(chat_id, username, ids[0]) if ids else None
-        title = escape(topic["title"])
+        title = escape(clip(topic["title"], 88))
         heading = f'<a href="{link}"><b>{title}</b></a>' if link else f"<b>{title}</b>"
         lines.append(f"{index}. {heading} ({message_count_label(topic['count'])})")
+        if topic.get("participants") is not None:
+            lines.append(f"Участников в теме: {topic['participants']}")
+        for highlight in topic.get("highlights", [])[:2]:
+            source = message_link(chat_id, username, highlight.get("message_id") or 0)
+            snippet = escape(clip(highlight["text"], 210))
+            lines.append(f'  • <a href="{source}">{snippet}</a>' if source else f"  • {snippet}")
+        if topic.get("keywords"):
+            lines.append("Ключевые слова: " + ", ".join(escape(word) for word in topic["keywords"][:5]))
+        if topic.get("is_other"):
+            lines.append(escape(topic.get("summary", "")))
+        lines.append("")
     if stats["topics"]:
         lines.append("")
     photo_links = [f'<a href="{url}">фото {number}</a>'
@@ -445,16 +459,56 @@ def format_text_report(stats: dict[str, Any], chat_id: int,
     authors = stats.get("authors", [])[:3]
     if authors:
         lines.append("<b>Активные:</b> " + ", ".join(
-            f"{escape(item['name'])} — {item['count']}" for item in authors))
+            f"{escape(clip(item['name'], 64))} — {item['count']}" for item in authors))
     words = stats.get("words", [])[:8]
     if words:
-        lines.append("<b>Частые слова:</b> " + ", ".join(
+        lines.append("<b>Слова по смыслу</b> (число сообщений): " + ", ".join(
             f"{escape(word)} ({count})" for word, count in words))
     if stats.get("average_score") is not None:
-        lines.append(f"<b>Игровой балл текста:</b> {stats['average_score']}")
+        lines.extend(["", f"<b>🧠 IQ* текста — средний: {stats['average_score']}</b>",
+                      "Игровой показатель, не измерение интеллекта. Компоненты: 0–100."])
+        scores = stats.get("participant_scores", [])
+        for item in scores[:10]:
+            lines.append(f"<b>{escape(clip(item['name'], 64))} — {item['score']}</b>"
+                         f" · достаточность данных: {escape(item.get('confidence', 'низкая'))}"
+                         f" · {message_count_label(item['messages'])}")
+            if "unique_messages" in item:
+                lines.append(f"Неповторяющихся сообщений: {item['unique_messages']}"
+                             f" · разных слов: {item['unique_words']}")
+            components = item.get("components", {})
+            if components:
+                lines.append("Словарь {vocabulary} · глубина {depth} · аргументы {reasoning}"
+                             " · диалог {dialogue} · структура {clarity}".format(**components))
+            if item.get("explanation"):
+                lines.append(escape(clip(item["explanation"], 200)))
+            if item.get("improvements"):
+                lines.append("Слабее выражены: " + escape(", ".join(item["improvements"])))
+        if len(scores) > 10:
+            lines.append(f"Показаны первые 10 из {len(scores)} участников с оценкой.")
+        lines.append("При малом объёме текста оценка предварительная и ближе к 100.")
     if username is None and not str(chat_id).startswith("-100") and stats["topics"]:
         lines.append("Ссылки на реплики появятся после перехода группы в супергруппу.")
     return "\n".join(lines).strip()
+
+
+def split_text_report(report: str, limit: int = 3900) -> list[str]:
+    """Split at complete HTML lines; keep tags/links and UTF-16 Telegram limits intact."""
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    for line in report.splitlines():
+        line_size = len(line.encode("utf-16-le")) // 2
+        # All report fields are bounded at formatting time, so lines fit independently.
+        if line_size > limit:
+            raise ValueError("A report line exceeds the Telegram message limit")
+        if current and size + line_size + 1 > limit:
+            chunks.append("\n".join(current).strip())
+            current, size = [], 0
+        current.append(line)
+        size += line_size + 1
+    if current:
+        chunks.append("\n".join(current).strip())
+    return [chunk for chunk in chunks if chunk]
 
 
 def send_dashboard(api: TelegramAPI, store: MessageStore, chat_id: int,
@@ -467,10 +521,13 @@ def send_dashboard(api: TelegramAPI, store: MessageStore, chat_id: int,
     api.send_photo(chat_id, png, caption)
     chat_info = store.chat_info(chat_id)
     try:
-        api.call("sendMessage", {"chat_id": chat_id,
-                                 "text": format_text_report(stats, chat_id, chat_info.get("username")),
-                                 "parse_mode": "HTML",
-                                 "link_preview_options": json.dumps({"is_disabled": True})})
+        report = format_text_report(stats, chat_id, chat_info.get("username"))
+        for index, part in enumerate(split_text_report(report)):
+            if index:
+                time.sleep(1.05)
+            api.call("sendMessage", {"chat_id": chat_id, "text": part,
+                                     "parse_mode": "HTML",
+                                     "link_preview_options": json.dumps({"is_disabled": True})})
     except Exception:
         # The image is already delivered. Avoid duplicating it on the next daily retry.
         LOG.exception("Could not send text report to chat %s", chat_id)

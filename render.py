@@ -132,15 +132,22 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
     topics = stats.get("topics", [])
     topic_rows = []
     for item in topics:
-        lines = wrap_lines(measure, item["title"], font(23, True), 960, 2)
-        topic_rows.append((item, lines, max(52, 18 + len(lines) * 30)))
-    list_height = sum(row[2] + 8 for row in topic_rows)
+        lines = wrap_lines(measure, item["title"], font(23, True), 950, 2)
+        summary = wrap_lines(measure, item.get("summary", ""), font(19), 1180, 2)
+        metadata = []
+        if item.get("participants") is not None:
+            metadata.append(f"Участников: {item['participants']}")
+        if item.get("keywords"):
+            metadata.append(", ".join(item["keywords"][:5]))
+        topic_rows.append((item, lines, summary, " · ".join(metadata),
+                           24 + len(lines) * 30 + len(summary) * 26 + (26 if metadata else 0)))
+    list_height = sum(row[4] + 8 for row in topic_rows)
     topic_height = 75 + list_height + 20
     if not topic_rows:
         topic_height = 185
     topic_y = 294
     lower_y = topic_y + topic_height + 18
-    lower_height = 340
+    lower_height = 410
     photo_y = lower_y + lower_height + 18
     photos = stats.get("photos", [])[:6]
     photo_cols = 2 if len(photos) in {2, 4} else 3
@@ -178,11 +185,18 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
         draw.text((72, topic_y + 102), "Пока нет текстовых сообщений для обзора", font=font(24), fill=MUTED)
     else:
         y = topic_y + 73
-        for index, (item, lines, row_height) in enumerate(topic_rows):
+        for index, (item, lines, summary, metadata, row_height) in enumerate(topic_rows):
             card(draw, (70, y, 1330, y + row_height), CARD_ALT)
             draw.ellipse((88, y + 20, 100, y + 32), fill=[CYAN, ORANGE, GREEN, "#C4B7F3"][index % 4])
             for line_index, line in enumerate(lines):
                 draw.text((113, y + 8 + line_index * 30), line, font=font(23, True), fill=WHITE)
+            detail_y = y + 14 + len(lines) * 30
+            for line in summary:
+                draw.text((113, detail_y), line, font=font(19), fill=MUTED)
+                detail_y += 26
+            if metadata:
+                draw.text((113, detail_y + 2), fit_text(draw, metadata, font(16), 1175),
+                          font=font(16), fill=CYAN)
             count_label = message_count_label(item["count"])
             draw.text((1304 - text_width(draw, count_label, font(18)), y + 16),
                       count_label, font=font(18), fill=MUTED)
@@ -208,13 +222,13 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
         draw.rounded_rectangle((68, y + 28, 444, y + 34), radius=3, fill=(52, 59, 68, 220))
         draw.rounded_rectangle((68, y + 28, 68 + int(376 * item["count"] / top_count), y + 34),
                                radius=3, fill=CYAN)
-    draw.text((68, lower_y + 253), "По часам", font=font(18, True), fill=MUTED)
+    draw.text((68, lower_y + 305), "По часам", font=font(18, True), fill=MUTED)
     hours = stats["hourly"]
     max_hour = max(max(hours), 1)
     for i, count in enumerate(hours):
         x = 68 + i * 16
         bar_height = max(2, int(count / max_hour * 49))
-        draw.rounded_rectangle((x, lower_y + 319 - bar_height, x + 10, lower_y + 319),
+        draw.rounded_rectangle((x, lower_y + 382 - bar_height, x + 10, lower_y + 382),
                                radius=3, fill=CYAN if count else "#39434E")
 
     # Individual playful IQ scores. No psychometric claim is made.
@@ -224,29 +238,32 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
         draw.text((511, lower_y + 98), "Мало текста для оценки", font=font(21), fill=MUTED)
         draw.text((511, lower_y + 131), "Нужно ≥2 сообщений и ≥8 слов", font=font(17), fill=MUTED)
     for i, item in enumerate(scores):
-        y = lower_y + 77 + i * 42
+        y = lower_y + 73 + i * 57
         draw.text((510, y), fit_text(draw, item["name"], font(21), 282), font=font(21), fill=WHITE)
         score = str(item["score"])
         draw.text((900 - text_width(draw, score, font(23, True)), y - 1), score,
                   font=font(23, True), fill=GREEN if i == 0 else ORANGE)
-        if i < 4:
-            draw.line((510, y + 35, 899, y + 35), fill="#48515B", width=1)
-    explanation = "* Слова, аргументы, диалог; не реальный IQ"
-    draw.text((510, lower_y + 306), fit_text(draw, explanation, font(16), 391),
+        sample_label = {"низкая": "Мало данных", "средняя": "Средний объём данных",
+                        "высокая": "Много данных"}.get(item.get("confidence"), "Мало данных")
+        confidence = f"{sample_label} · {item.get('unique_messages', item['messages'])} разных сообщ."
+        draw.text((510, y + 28), fit_text(draw, confidence, font(15), 391), font=font(15), fill=MUTED)
+    explanation = "* Разбор в тексте отчёта; не реальный IQ"
+    draw.text((510, lower_y + 379), fit_text(draw, explanation, font(16), 391),
               font=font(16), fill=MUTED)
 
     # Word cloud as compact chips.
-    draw.text((963, lower_y + 22), "Частые слова", font=font(27, True), fill=WHITE)
+    draw.text((963, lower_y + 22), "Слова по смыслу", font=font(25, True), fill=WHITE)
+    draw.text((964, lower_y + 59), "Число сообщений со словом", font=font(16), fill=MUTED)
     if not stats["words"]:
         draw.text((964, lower_y + 98), "Пока нет слов", font=font(21), fill=MUTED)
     else:
-        x, y = 964, lower_y + 72
+        x, y = 964, lower_y + 92
         for index, (word, count) in enumerate(stats["words"][:12]):
             label = f"{word}  {count}"
             chip_width = min(362, text_width(draw, label, font(19, True)) + 27)
             if x + chip_width > 1332:
                 x, y = 964, y + 48
-            if y + 40 > lower_y + 326:
+            if y + 40 > lower_y + 389:
                 break
             draw.rounded_rectangle((x, y, x + chip_width, y + 38), radius=13,
                                    fill=CARD_ALT if index % 2 else (64, 74, 86, 190))
