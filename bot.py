@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from html import escape
 import logging
 import os
 import re
@@ -19,16 +18,17 @@ from urllib.request import Request, urlopen
 import uuid
 from zoneinfo import ZoneInfo
 
-from analytics import WINDOW_SECONDS, analyze, message_count_label
+from analytics import WINDOW_SECONDS, analyze
 from render import render_dashboard
-from topics import clip
+from reports import format_text_report, message_link, report_keyboard, report_page
 
 
 LOG = logging.getLogger("chat_dashboard")
 HELP = (
-    "📊 /dashboard — картинка и текстовая сводка за последние 24 часа со ссылками на реплики.\n"
-    "💬 Темы: краткое содержание, ключевые слова и участники обсуждения.\n"
-    "🧠 IQ* — игровой балл текста с разбором показателей и достаточности данных.\n"
+    "📊 /dashboard — картинка с короткой сводкой за 24 часа.\n"
+    "💬 Кнопка «Темы» — суть, вопросы и явные итоги со ссылками на реплики.\n"
+    "🧠 Кнопка «IQ*» — разбор игрового балла текста.\n"
+    "Кнопки листают подробности в том же сообщении; «Кратко» возвращает сводку.\n"
     "🛡 /banadmins — снять и забанить всех доступных боту администраторов супергруппы; только для владельца.\n"
     "📷 Фото выбираются по сумме реакций и ответов; для учёта реакций бот должен быть администратором.\n"
     "🕘 Ежедневный отчёт приходит автоматически в настроенное время.\n"
@@ -69,10 +69,14 @@ class TelegramAPI:
             raise TelegramAPIError(f"{method}: {result.get('description', 'unknown error')}")
         return result["result"]
 
-    def send_photo(self, chat_id: int, png: bytes, caption: str) -> None:
+    def send_photo(self, chat_id: int, png: bytes, caption: str,
+                   reply_markup: dict[str, Any] | None = None) -> None:
         boundary = "codex" + uuid.uuid4().hex
         parts = []
-        for key, value in {"chat_id": str(chat_id), "caption": caption}.items():
+        fields = {"chat_id": str(chat_id), "caption": caption, "parse_mode": "HTML"}
+        if reply_markup is not None:
+            fields["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        for key, value in fields.items():
             parts.append(
                 f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n"
                 f"{value}\r\n".encode("utf-8")
@@ -171,6 +175,15 @@ class MessageStore:
             )
         """)
         self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS report_snapshots (
+                report_id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            )
+        """)
+        self.conn.execute("CREATE INDEX IF NOT EXISTS report_snapshots_date_idx ON report_snapshots(created_at)")
+        self.conn.execute("""
             INSERT OR IGNORE INTO chats (chat_id, last_seen)
             SELECT chat_id, MAX(date) FROM messages GROUP BY chat_id
         """)
@@ -237,6 +250,7 @@ class MessageStore:
 
     def prune(self, now: int) -> None:
         self.conn.execute("DELETE FROM messages WHERE date < ?", (now - WINDOW_SECONDS,))
+        self.conn.execute("DELETE FROM report_snapshots WHERE created_at < ?", (now - WINDOW_SECONDS,))
         for table in ("photo_reactions", "photo_reaction_totals"):
             self.conn.execute(f"""
                 DELETE FROM {table} WHERE NOT EXISTS (
@@ -277,6 +291,22 @@ class MessageStore:
             INSERT OR IGNORE INTO daily_reports (chat_id, local_day, sent_at) VALUES (?, ?, ?)
         """, (chat_id, local_day, now))
         self.conn.commit()
+
+    def save_report(self, chat_id: int, now: int, stats: dict[str, Any],
+                    username: str | None) -> str:
+        report_id = uuid.uuid4().hex[:12]
+        payload = json.dumps({"stats": stats, "username": username}, ensure_ascii=False)
+        self.conn.execute("INSERT INTO report_snapshots VALUES (?, ?, ?, ?)",
+                          (report_id, chat_id, now, payload))
+        self.conn.commit()
+        return report_id
+
+    def load_report(self, report_id: str, chat_id: int, now: int) -> dict[str, Any] | None:
+        row = self.conn.execute("""
+            SELECT payload FROM report_snapshots WHERE report_id = ? AND chat_id = ?
+            AND created_at BETWEEN ? AND ?
+        """, (report_id, chat_id, now - WINDOW_SECONDS, now)).fetchone()
+        return json.loads(row[0]) if row else None
 
     def recent(self, chat_id: int, now: int) -> list[dict[str, Any]]:
         rows = self.conn.execute("""
@@ -413,124 +443,17 @@ def ban_admins(api: TelegramAPI, msg: dict[str, Any]) -> None:
     ])
 
 
-def message_link(chat_id: int, username: str | None, message_id: int) -> str | None:
-    if message_id <= 0:
-        return None
-    if username and re.fullmatch(r"[A-Za-z0-9_]+", username):
-        return f"https://t.me/{username}/{message_id}"
-    # Telegram's /c/ links address private supergroups by ID without the -100 prefix.
-    if str(chat_id).startswith("-100"):
-        return f"https://t.me/c/{str(chat_id)[4:]}/{message_id}"
-    return None
-
-
-def format_text_report(stats: dict[str, Any], chat_id: int,
-                       username: str | None) -> str:
-    lines = ["<b>📅 Что обсуждали за последние 24 часа</b>",
-             f"{stats['start']}–{stats['end']} · сообщений: {stats['messages']}"
-             f" · фото: {stats.get('photo_count', len(stats['photos']))}", ""]
-    if not stats["topics"]:
-        lines.append("Пока нет текстовых сообщений для обзора.")
-    for index, topic in enumerate(stats["topics"], 1):
-        ids = topic.get("message_ids", [])
-        link = message_link(chat_id, username, ids[0]) if ids else None
-        title = escape(clip(topic["title"], 88))
-        heading = f'<a href="{link}"><b>{title}</b></a>' if link else f"<b>{title}</b>"
-        lines.append(f"{index}. {heading} ({message_count_label(topic['count'])})")
-        if topic.get("participants") is not None:
-            lines.append(f"Участников в теме: {topic['participants']}")
-        for highlight in topic.get("highlights", [])[:2]:
-            source = message_link(chat_id, username, highlight.get("message_id") or 0)
-            snippet = escape(clip(highlight["text"], 210))
-            lines.append(f'  • <a href="{source}">{snippet}</a>' if source else f"  • {snippet}")
-        if topic.get("keywords"):
-            lines.append("Ключевые слова: " + ", ".join(escape(word) for word in topic["keywords"][:5]))
-        if topic.get("is_other"):
-            lines.append(escape(topic.get("summary", "")))
-        lines.append("")
-    if stats["topics"]:
-        lines.append("")
-    photo_links = [f'<a href="{url}">фото {number}</a>'
-                   f" (♥ {photo.get('reaction_count', 0)}, ответов {photo.get('reply_count', 0)})"
-                   for number, photo in enumerate(stats["photos"][:3], 1)
-                   if (url := message_link(chat_id, username, photo["message_id"]))]
-    if photo_links:
-        lines.append("<b>📷 Фото с откликом:</b> " + " · ".join(photo_links))
-    authors = stats.get("authors", [])[:3]
-    if authors:
-        lines.append("<b>Активные:</b> " + ", ".join(
-            f"{escape(clip(item['name'], 64))} — {item['count']}" for item in authors))
-    words = stats.get("words", [])[:8]
-    if words:
-        lines.append("<b>Слова по смыслу</b> (число сообщений): " + ", ".join(
-            f"{escape(word)} ({count})" for word, count in words))
-    if stats.get("average_score") is not None:
-        lines.extend(["", f"<b>🧠 IQ* текста — средний: {stats['average_score']}</b>",
-                      "Игровой показатель, не измерение интеллекта. Компоненты: 0–100."])
-        scores = stats.get("participant_scores", [])
-        for item in scores[:10]:
-            lines.append(f"<b>{escape(clip(item['name'], 64))} — {item['score']}</b>"
-                         f" · достаточность данных: {escape(item.get('confidence', 'низкая'))}"
-                         f" · {message_count_label(item['messages'])}")
-            if "unique_messages" in item:
-                lines.append(f"Неповторяющихся сообщений: {item['unique_messages']}"
-                             f" · разных слов: {item['unique_words']}")
-            components = item.get("components", {})
-            if components:
-                lines.append("Словарь {vocabulary} · глубина {depth} · аргументы {reasoning}"
-                             " · диалог {dialogue} · структура {clarity}".format(**components))
-            if item.get("explanation"):
-                lines.append(escape(clip(item["explanation"], 200)))
-            if item.get("improvements"):
-                lines.append("Слабее выражены: " + escape(", ".join(item["improvements"])))
-        if len(scores) > 10:
-            lines.append(f"Показаны первые 10 из {len(scores)} участников с оценкой.")
-        lines.append("При малом объёме текста оценка предварительная и ближе к 100.")
-    if username is None and not str(chat_id).startswith("-100") and stats["topics"]:
-        lines.append("Ссылки на реплики появятся после перехода группы в супергруппу.")
-    return "\n".join(lines).strip()
-
-
-def split_text_report(report: str, limit: int = 3900) -> list[str]:
-    """Split at complete HTML lines; keep tags/links and UTF-16 Telegram limits intact."""
-    chunks: list[str] = []
-    current: list[str] = []
-    size = 0
-    for line in report.splitlines():
-        line_size = len(line.encode("utf-16-le")) // 2
-        # All report fields are bounded at formatting time, so lines fit independently.
-        if line_size > limit:
-            raise ValueError("A report line exceeds the Telegram message limit")
-        if current and size + line_size + 1 > limit:
-            chunks.append("\n".join(current).strip())
-            current, size = [], 0
-        current.append(line)
-        size += line_size + 1
-    if current:
-        chunks.append("\n".join(current).strip())
-    return [chunk for chunk in chunks if chunk]
-
-
 def send_dashboard(api: TelegramAPI, store: MessageStore, chat_id: int,
                    now: int, tz_name: str, daily: bool = False) -> None:
     api.call("sendChatAction", {"chat_id": chat_id, "action": "upload_photo"})
     stats = analyze(store.recent(chat_id, now), now, tz_name)
     photos = [api.download_photo(item["photo_file_id"]) for item in stats["photos"]]
     png = render_dashboard(stats, photos)
-    caption = "📊 Ежедневная сводка за 24 часа" if daily else "📊 Сводка за последние 24 часа"
-    api.send_photo(chat_id, png, caption)
+    stats["daily"] = daily
     chat_info = store.chat_info(chat_id)
-    try:
-        report = format_text_report(stats, chat_id, chat_info.get("username"))
-        for index, part in enumerate(split_text_report(report)):
-            if index:
-                time.sleep(1.05)
-            api.call("sendMessage", {"chat_id": chat_id, "text": part,
-                                     "parse_mode": "HTML",
-                                     "link_preview_options": json.dumps({"is_disabled": True})})
-    except Exception:
-        # The image is already delivered. Avoid duplicating it on the next daily retry.
-        LOG.exception("Could not send text report to chat %s", chat_id)
+    report_id = store.save_report(chat_id, now, stats, chat_info.get("username"))
+    caption = report_page(stats, chat_id, chat_info.get("username"))
+    api.send_photo(chat_id, png, caption, reply_markup=report_keyboard(stats, report_id))
     LOG.info("Sent %s dashboard to chat %s: %s messages",
              "daily" if daily else "manual", chat_id, stats["messages"])
 
@@ -555,8 +478,45 @@ def send_due_daily_reports(api: TelegramAPI, store: MessageStore, now: int,
             LOG.exception("Could not send daily dashboard to chat %s", chat_id)
 
 
+def handle_report_callback(query: dict[str, Any], api: TelegramAPI,
+                           store: MessageStore) -> None:
+    message = query.get("message") or {}
+    chat = message.get("chat") or {}
+    match = re.fullmatch(r"report:([0-9a-f]{12}):(brief|topics|scores):([0-9]{1,6})",
+                         query.get("data") or "")
+    snapshot = None
+    if match and chat.get("type") in {"group", "supergroup"} and message.get("message_id"):
+        snapshot = store.load_report(match[1], chat["id"], int(time.time()))
+    if snapshot is None:
+        api.call("answerCallbackQuery", {"callback_query_id": query["id"],
+                 "text": "Сводка недоступна или устарела. Запустите /dashboard."})
+        return
+    view, page = match[2], int(match[3])
+    stats = snapshot["stats"]
+    total = len(stats.get("topics" if view == "topics" else "participant_scores", []))
+    if (view == "brief" and page != 0) or (view != "brief" and page >= total):
+        api.call("answerCallbackQuery", {"callback_query_id": query["id"],
+                 "text": "Этой страницы нет. Откройте сводку заново."})
+        return
+    api.call("answerCallbackQuery", {"callback_query_id": query["id"]})
+    try:
+        api.call("editMessageCaption", {
+            "chat_id": chat["id"], "message_id": message["message_id"],
+            "caption": report_page(stats, chat["id"], snapshot["username"], view, page),
+            "parse_mode": "HTML",
+            "reply_markup": json.dumps(report_keyboard(stats, match[1], view, page), ensure_ascii=False),
+        })
+    except TelegramAPIError as exc:
+        # Repeated clicks can race; Telegram rejects an identical edit harmlessly.
+        if "message is not modified" not in str(exc).lower():
+            raise
+
+
 def handle_update(update: dict[str, Any], api: TelegramAPI, store: MessageStore,
                   bot_username: str, tz_name: str) -> None:
+    if update.get("callback_query"):
+        handle_report_callback(update["callback_query"], api, store)
+        return
     reaction = update.get("message_reaction")
     if reaction:
         chat = reaction.get("chat") or {}
@@ -624,7 +584,7 @@ def main() -> int:
             payload: dict[str, Any] = {
                 "timeout": 30,
                 "allowed_updates": json.dumps([
-                    "message", "edited_message", "message_reaction", "message_reaction_count"
+                    "message", "edited_message", "message_reaction", "message_reaction_count", "callback_query"
                 ]),
             }
             if offset is not None:

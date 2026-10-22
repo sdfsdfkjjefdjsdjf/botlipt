@@ -9,7 +9,8 @@ import unittest
 from PIL import Image
 
 from analytics import analyze
-from bot import MessageStore, format_text_report, send_dashboard, split_text_report
+from bot import MessageStore, format_text_report, send_dashboard
+from reports import format_score_page, format_topic_page, report_page, visible_length
 from render import render_dashboard
 from scoring import estimate_participant_scores, reasoning_signals
 from text_analysis import meaningful_words, tokens
@@ -244,24 +245,34 @@ class ReportTests(unittest.TestCase):
         stats = analyze(items, NOW)
         report = format_text_report(stats, -100123, None)
         self.assertIn("&lt;сон&gt; &amp;", report)
-        self.assertIn("Ключевые слова:", report)
-        self.assertIn("Словарь", report)
-        self.assertIn("данных: низкая", report)
+        self.assertNotIn("Ключевые слова:", report)
+        self.assertNotIn("Словарь", report)
+        self.assertIn("Ключевые слова:", format_topic_page(stats, -100123, None, 0))
+        score_page = format_score_page(stats, 0)
+        self.assertIn("Словарь", score_page)
+        self.assertIn("данных: низкая", score_page)
         self.assertIn('href="https://t.me/c/123/', report)
 
-    def test_long_report_splits_into_independently_valid_telegram_html(self):
+    def test_all_caption_pages_fit_with_emoji_long_fields_and_escaped_html(self):
         stats = analyze(messages(["Обновление драйверов NVIDIA исправило сон монитора."] * 2), NOW)
         topic = stats["topics"][0]
-        stats["topics"] = [{**topic, "title": "Обновление <драйвера> & монитор 🖥 " * 4,
-                            "highlights": [{"message_id": 1, "text": "<&> 🖥 " * 100}] * 2}
+        point = {"message_id": 1, "kind": "context", "text": "<&> 🖥 " * 100}
+        stats["topics"] = [{**topic, "title": "Обновление <драйвера> & монитор 🖥 " * 40,
+                            "brief": point, "points": [point] * 3, "highlights": [point] * 2}
                            for _ in range(9)]
-        report = format_text_report(stats, -100123, None)
-        parts = split_text_report(report)
-        self.assertGreater(len(parts), 1)
-        for part in parts:
-            self.assertLessEqual(len(part.encode("utf-16-le")) // 2, 3900)
+        score = stats["participant_scores"][0]
+        stats["participant_scores"] = [{**score, "name": "<Имя & 🖥> " * 100,
+                                          "explanation": "<&> 🖥 " * 100} for _ in range(14)]
+        reports = [report_page(stats, -100123, None)]
+        reports += [report_page(stats, -100123, None, "topics", index) for index in range(9)]
+        reports += [report_page(stats, -100123, None, "scores", index) for index in range(14)]
+        self.assertEqual(reports[0].count(" сообщ."), 4)  # header + three topics
+        self.assertIn("Ещё тем: 6", reports[0])
+        self.assertIn("не оценка интеллекта", reports[0])
+        for report in reports:
+            self.assertLessEqual(visible_length(report), 900)
             parser = BalancedHTML()
-            parser.feed(part)
+            parser.feed(report)
             self.assertEqual(parser.stack, [])
 
     def test_empty_and_long_topic_dashboards_render(self):
@@ -271,31 +282,34 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(image.width, 1400)
                 self.assertLess(image.width + image.height, 10_000)
 
-    def test_full_report_delivery_uses_all_text_chunks(self):
+    def test_report_delivery_is_one_photo_with_short_caption_and_buttons(self):
         class API:
             def __init__(self):
-                self.parts = []
-                self.photos = 0
+                self.calls = []
+                self.photos = []
 
             def call(self, method, payload):
-                if method == "sendMessage":
-                    self.parts.append(payload["text"])
+                self.calls.append((method, payload))
 
             def download_photo(self, _):
                 return None
 
-            def send_photo(self, *args):
-                self.photos += 1
+            def send_photo(self, chat_id, png, caption, reply_markup=None):
+                self.photos.append((chat_id, caption, reply_markup))
 
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as directory:
             store = MessageStore(Path(directory) / "test.sqlite3")
+            store.upsert({"chat": {"id": -100123}, "message_id": 1, "date": NOW - 5,
+                          "from": {"id": 1, "first_name": "Аня"},
+                          "text": "Обновление драйвера NVIDIA исправляет сон монитора."})
             api = API()
-            long_report = "\n".join(f"<b>Тема {index}</b>: " + "подробности " * 20 for index in range(60))
-            with patch("bot.format_text_report", return_value=long_report), patch("bot.time.sleep"):
+            with patch("bot.render_dashboard", return_value=b"preview"):
                 send_dashboard(api, store, -100123, NOW, "UTC")
-            self.assertEqual(api.photos, 1)
-            self.assertEqual(api.parts, split_text_report(long_report))
+            self.assertEqual(len(api.photos), 1)
+            self.assertLessEqual(visible_length(api.photos[0][1]), 900)
+            self.assertEqual(api.photos[0][2]["inline_keyboard"][0][0]["text"], "💬 Темы")
+            self.assertFalse(any(method == "sendMessage" for method, _ in api.calls))
             store.conn.close()
 
 

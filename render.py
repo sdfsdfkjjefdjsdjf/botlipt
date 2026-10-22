@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 from analytics import message_count_label
+from reports import BRIEF_TOPICS, topic_total
 
 
 WIDTH = 1400
@@ -22,6 +24,7 @@ GREEN = "#A9BDB3"
 PORTRAIT = Path(__file__).parent / "assets" / "silver_guardian.jpg"
 
 
+@lru_cache(maxsize=64)
 def font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     candidates = [
         "C:/Windows/Fonts/segoeuib.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf",
@@ -129,16 +132,16 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
     """Return an adaptive-height PNG. photo_bytes matches stats['photos']."""
     photo_bytes = photo_bytes or []
     measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    topics = stats.get("topics", [])
+    all_topics = stats.get("topics", [])
+    topics = [topic for topic in all_topics if not topic.get("is_other")][:BRIEF_TOPICS]
     topic_rows = []
     for item in topics:
         lines = wrap_lines(measure, item["title"], font(23, True), 950, 2)
-        summary = wrap_lines(measure, item.get("summary", ""), font(19), 1180, 2)
+        brief = item.get("brief") or {}
+        summary = wrap_lines(measure, brief.get("text") or item.get("summary", ""), font(19), 1180, 1)
         metadata = []
         if item.get("participants") is not None:
             metadata.append(f"Участников: {item['participants']}")
-        if item.get("keywords"):
-            metadata.append(", ".join(item["keywords"][:5]))
         topic_rows.append((item, lines, summary, " · ".join(metadata),
                            24 + len(lines) * 30 + len(summary) * 26 + (26 if metadata else 0)))
     list_height = sum(row[4] + 8 for row in topic_rows)
@@ -179,8 +182,9 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
 
     card(draw, (44, topic_y, 1356, topic_y + topic_height))
     draw.text((70, topic_y + 23), "Что обсуждали", font=font(30, True), fill=WHITE)
-    draw.text((1327 - text_width(draw, "Темы за 24 часа", font(17)), topic_y + 32),
-              "Темы за 24 часа", font=font(17), fill=MUTED)
+    topic_label = f"Главные: {len(topics)} из {topic_total(all_topics)} · подробнее — по кнопке"
+    draw.text((1327 - text_width(draw, topic_label, font(17)), topic_y + 32),
+              topic_label, font=font(17), fill=MUTED)
     if not topic_rows:
         draw.text((72, topic_y + 102), "Пока нет текстовых сообщений для обзора", font=font(24), fill=MUTED)
     else:
@@ -247,7 +251,7 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
                         "высокая": "Много данных"}.get(item.get("confidence"), "Мало данных")
         confidence = f"{sample_label} · {item.get('unique_messages', item['messages'])} разных сообщ."
         draw.text((510, y + 28), fit_text(draw, confidence, font(15), 391), font=font(15), fill=MUTED)
-    explanation = "* Разбор в тексте отчёта; не реальный IQ"
+    explanation = "* Разбор — кнопка IQ*; не реальный IQ"
     draw.text((510, lower_y + 379), fit_text(draw, explanation, font(16), 391),
               font=font(16), fill=MUTED)
 
@@ -286,7 +290,7 @@ def render_dashboard(stats: dict[str, Any], photo_bytes: list[bytes | None] | No
             photo_tile(canvas, draw, (x1, y1, x1 + tile_width, y1 + 218), info,
                        photo_bytes[i] if i < len(photo_bytes) else None)
 
-    draw.text((45, footer_y + 12), "Темы сгруппированы локально · IQ* — игровой показатель текстов · учтены только полученные сообщения",
+    draw.text((45, footer_y + 12), "Подробности тем и IQ* — по кнопкам · IQ* — игровой показатель текста · учтены только полученные сообщения",
               font=font(17), fill=MUTED)
     output = BytesIO()
     canvas.save(output, format="PNG", optimize=True)
