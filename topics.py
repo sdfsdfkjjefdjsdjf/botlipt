@@ -29,6 +29,12 @@ GENERIC_TERMS = {"тема", "план", "проект", "вопрос", "про
 TITLE_ACTIONS = {"обновление", "бронирование", "выбор", "настройка", "установка", "ремонт",
                  "перенос", "проверка", "разработка", "планирование", "поездка", "встреча"}
 TITLE_PREPOSITIONS = {"в", "на", "для", "с", "о", "по", "из"}
+OUTCOME_RE = re.compile(
+    r"\b(?:решили|договорились|согласовали|подтвердили|забронировали|"
+    r"исправили|заработал[аои]?|итог(?:и)?|результат проверки)\b", re.I)
+UNCERTAIN_RE = re.compile(
+    r"\b(?:если|возможно|наверное|может быть|не решили|не договорились|"
+    r"не согласовали|не подтвердили|не забронировали|не исправили|не заработал[аои]?)\b", re.I)
 PREFIX_RE = re.compile(
     r"^(?:(?:ну|короче|кстати|слушайте|ребята|друзья|согласна|согласен|"
     r"да|ага|точно|окей|мне кажется|я думаю|я считаю|думаю|хочу обсудить|"
@@ -39,7 +45,11 @@ def clip(text: str, limit: int) -> str:
     text = " ".join(text.split())
     if len(text) <= limit:
         return text
-    return text[:limit - 1].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
+    head = text[:limit - 1]
+    boundary = head.rfind(" ")
+    if boundary >= limit // 2:
+        head = head[:boundary]
+    return head.rstrip(" ,;:") + "…"
 
 
 def cosine(left: dict[str, float], right: dict[str, float]) -> float:
@@ -89,16 +99,22 @@ def heading_form(phrase: str) -> str:
 def describe_topic(items: list[dict[str, Any]], idf: dict[str, float]) -> dict[str, Any]:
     support: Counter[str] = Counter()
     nominal_terms: set[str] = set()
+    seen: set[frozenset[str]] = set()
     for item in items:
-        support.update(sorted(set(tokens(item.get("text") or ""))))
-        nominal_terms.update(lemma for _, lemma, pos in lexemes(item.get("text") or "")
+        features = lexemes(item.get("text") or "")
+        signature = frozenset(lemma for _, lemma, _ in features)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        support.update(sorted(signature))
+        nominal_terms.update(lemma for _, lemma, pos in features
                              if (pos in NOMINAL_POS or pos is None) and lemma not in GENERIC_ADJECTIVES)
     importance = {term: count * idf.get(term, 1) for term, count in support.items()}
     keywords = sorted(nominal_terms, key=lambda term: (-importance[term], term))[:6]
     candidates = []
     phrases: dict[tuple[str, ...], list] = {}
     for item_index, item in enumerate(items):
-        for sentence_index, sentence in enumerate(sentences(item.get("text") or "")):
+        for sentence_index, sentence in enumerate(sentences(item.get("text") or "")[:32]):
             sentence = PREFIX_RE.sub("", sentence).strip()
             features = lexemes(sentence)
             terms = {lemma for _, lemma, _ in features}
@@ -134,9 +150,10 @@ def describe_topic(items: list[dict[str, Any]], idf: dict[str, float]) -> dict[s
                     run.append((original, lemma, pos))
                     for length in range(2, min(6, len(run)) + 1):
                         piece = run[-length:]
-                        if piece[0][2] == "PREP" or piece[-1][2] == "PREP":
+                        if piece[0][2] == "PREP" or piece[-1][2] not in {"NOUN", "LATN"}:
                             continue
-                        if not any(pos in {"NOUN", "LATN"} for _, _, pos in piece):
+                        if not any(pos in {"NOUN", "LATN"} and term not in GENERIC_TERMS | {"сообщение"}
+                                   for _, term, pos in piece):
                             continue
                         key = tuple(term for _, term, pos in piece if pos != "PREP")
                         if len(set(key)) < 2:
@@ -183,7 +200,28 @@ def describe_topic(items: list[dict[str, Any]], idf: dict[str, float]) -> dict[s
     ids = list(dict.fromkeys(mid for mid in [anchor_id] + [h["message_id"] for h in highlights] if mid))
     summary = " ".join(h["text"] if h["text"].endswith((".", "!", "?", "…")) else h["text"] + "."
                        for h in highlights)
+    # Labels describe explicit source sentences, never inferred decisions or tasks.
+    groups: dict[str, list] = {"context": [], "question": [], "outcome": []}
+    for candidate in candidates:
+        sentence = candidate[3]
+        role = ("question" if "?" in sentence else
+                "outcome" if OUTCOME_RE.search(sentence) and not UNCERTAIN_RE.search(sentence)
+                else "context")
+        groups[role].append(candidate)
+    points = []
+    for role in ("context", "question", "outcome"):
+        rows = groups[role]
+        # A later explicit result is more useful than an earlier interim result.
+        if role == "outcome":
+            rows = sorted(rows, key=lambda row: (-row[1], -row[2]))
+        for _, _, _, sentence, _, message_id in rows:
+            points.append({"kind": role, "text": clip(sentence, 190), "message_id": message_id})
+            break
+    brief = next((point for point in reversed(points) if point["kind"] == "outcome"),
+                 next((point for point in points if point["kind"] == "context"),
+                      points[0] if points else None))
     return {"title": title, "summary": summary,
+            "points": points, "brief": brief, "unique_count": len(seen - {frozenset()}),
             "highlights": highlights, "keywords": keywords, "message_ids": ids,
             "count": len(items), "participants": len({str(m.get('sender_id')) for m in items}),
             "start_date": items[0]["date"], "end_date": items[-1]["date"]}
@@ -200,6 +238,7 @@ def build_topics(text_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     clusters: list[dict[str, Any]] = []
     inverted: dict[str, OrderedDict[int, None]] = defaultdict(OrderedDict)
     assignments: dict[int, int] = {}
+    reply_bridges: list[tuple[int, int]] = []
     for message, terms in zip(messages, features):
         parent = assignments.get(message.get("reply_to_message_id"))
         if not terms - GENERIC_TERMS:
@@ -218,6 +257,7 @@ def build_topics(text_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if parent is not None and parent not in candidates:
             candidates.append(parent)
         best_index, best_score = None, 0.0
+        bridges = []
         for index in candidates:
             cluster = clusters[index]
             if int(message["date"]) - cluster["last_date"] > TOPIC_GAP and index != parent:
@@ -228,6 +268,9 @@ def build_topics(text_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             recent = cluster["vectors"][-5:]
             similarity = max([cosine(vector, centroid)] + [cosine(vector, old) for old in recent])
             shared = terms & core.keys()
+            if (parent is not None and index != parent and similarity >= 0.40
+                    and len(shared - GENERIC_TERMS) >= 3):
+                bridges.append(index)
             # A brief explicit answer can carry its meaning through the reply relation.
             reply_match = index == parent and (len(terms) <= 3 or bool(shared))
             short_followup = (len(terms) <= 4 and bool(shared - GENERIC_TERMS)
@@ -245,6 +288,8 @@ def build_topics(text_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             clusters.append({"items": [], "support": Counter(), "vectors": [],
                              "last_date": int(message["date"])})
         cluster = clusters[best_index]
+        if best_index == parent:
+            reply_bridges.extend((best_index, index) for index in bridges)
         cluster["items"].append(message)
         cluster["support"].update(sorted(terms))
         cluster["vectors"].append(vector)
@@ -258,12 +303,33 @@ def build_topics(text_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if message.get("message_id"):
             assignments[message["message_id"]] = best_index
 
-    clusters.sort(key=lambda group: (-len(group["items"]), -group["last_date"]))
+    # A reply can connect a terse question back to its original discussion.
+    # Merge only through an explicit reply plus several shared meaningful terms.
+    roots = list(range(len(clusters)))
+    def root(index: int) -> int:
+        while roots[index] != index:
+            roots[index] = roots[roots[index]]
+            index = roots[index]
+        return index
+    for left, right in reply_bridges:
+        roots[root(right)] = root(left)
+    merged: dict[int, dict[str, Any]] = {}
+    for index, cluster in enumerate(clusters):
+        group = merged.setdefault(root(index), {"items": [], "vectors": [], "last_date": 0})
+        group["items"].extend(cluster["items"])
+        group["vectors"].extend(cluster["vectors"])
+        group["last_date"] = max(group["last_date"], cluster["last_date"])
+    clusters = list(merged.values())
+    for group in clusters:
+        group["items"].sort(key=lambda message: (int(message["date"]), message.get("message_id") or 0))
+    clusters.sort(key=lambda group: (-len({frozenset(vector) for vector in group["vectors"]}),
+                                     -len(group["items"]), -group["last_date"]))
     topics = [describe_topic(group["items"], idf) for group in clusters[:MAX_TOPICS]]
     if len(clusters) > MAX_TOPICS:
         rest = sorted((m for group in clusters[MAX_TOPICS:] for m in group["items"]),
                       key=lambda m: (m["date"], m.get("message_id") or 0))
         topics.append({"title": "Другие обсуждения", "count": len(rest),
+                       "topic_count": len(clusters) - MAX_TOPICS,
                        "summary": f"Ещё отдельных тем: {len(clusters) - MAX_TOPICS}.",
                        "keywords": [], "highlights": [], "message_ids": [], "is_other": True,
                        "participants": len({str(m.get('sender_id')) for m in rest})})

@@ -62,7 +62,7 @@ class DashboardTests(unittest.TestCase):
             def download_photo(self, file_id):
                 return None
 
-            def send_photo(self, chat_id, png, caption):
+            def send_photo(self, chat_id, png, caption, reply_markup=None):
                 self.photos.append((chat_id, png, caption))
 
         with tempfile.TemporaryDirectory() as folder:
@@ -81,9 +81,8 @@ class DashboardTests(unittest.TestCase):
                           api, store, "OurBot", "UTC")
             self.assertEqual(len(api.photos), 1)
             reports = [payload for method, payload in api.calls if method == "sendMessage"]
-            self.assertEqual(len(reports), 1)
-            self.assertIn("https://t.me/c/1/1", reports[0]["text"])
-            self.assertEqual(reports[0]["parse_mode"], "HTML")
+            self.assertEqual(len(reports), 0)
+            self.assertIn("https://t.me/c/1/1", api.photos[0][2])
             self.assertEqual(api.photos[0][0], -1001)
             with Image.open(BytesIO(api.photos[0][1])) as image:
                 self.assertEqual(image.width, 1400)
@@ -236,9 +235,12 @@ class DashboardTests(unittest.TestCase):
         stats = analyze(messages, now)
         self.assertEqual(len(stats["topics"]), len(bodies))
         report = format_text_report(stats, -100123, None)
-        self.assertEqual(report.count("(1 сообщение)"), len(bodies))
-        for message_id in range(1, len(bodies) + 1):
-            self.assertIn(f'https://t.me/c/123/{message_id}', report)
+        self.assertEqual(report.count(" · 1 сообщ."), 3)
+        self.assertIn("Ещё тем: 2", report)
+        from reports import format_topic_page
+        for index, topic in enumerate(stats["topics"]):
+            page = format_topic_page(stats, -100123, None, index)
+            self.assertIn(f'https://t.me/c/123/{topic["message_ids"][0]}', page)
         self.assertTrue(all(" · " not in item["title"] for item in stats["topics"]))
 
     def test_reasoned_dialogue_scores_above_repetition(self):
@@ -273,7 +275,7 @@ class DashboardTests(unittest.TestCase):
             def download_photo(self, file_id):
                 return None
 
-            def send_photo(self, chat_id, png, caption):
+            def send_photo(self, chat_id, png, caption, reply_markup=None):
                 self.photos.append((chat_id, caption))
 
         before = int(datetime(2033, 5, 18, 8, 59, tzinfo=timezone.utc).timestamp())
@@ -289,14 +291,14 @@ class DashboardTests(unittest.TestCase):
             send_due_daily_reports(api, store, now, "UTC", schedule)
             send_due_daily_reports(api, store, now + 60, "UTC", schedule)
             self.assertEqual(len(api.photos), 1)
-            self.assertEqual(len(api.messages), 1)
+            self.assertEqual(len(api.messages), 0)
             store.conn.close()
             store = MessageStore(path)
             send_due_daily_reports(api, store, now + 120, "UTC", schedule)
             self.assertEqual(len(api.photos), 1)
             send_due_daily_reports(api, store, now + 86400, "UTC", schedule)
             self.assertEqual(len(api.photos), 2)
-            self.assertEqual(len(api.messages), 2)
+            self.assertEqual(len(api.messages), 0)
             self.assertIn("Ежедневная", api.photos[0][1])
             store.conn.close()
 
